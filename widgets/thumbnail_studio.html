@@ -1,0 +1,247 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="color-scheme" content="light dark" />
+<!-- Preconnect to Kie's image CDN so the first thumbnail loads fast once it
+     arrives. (The CSP allowlist on the resource declares the same origins.) -->
+<link rel="preconnect" href="https://tempfile.aiquickdraw.com" crossorigin />
+<link rel="preconnect" href="https://file.aiquickdraw.com" crossorigin />
+<link rel="preconnect" href="https://cdn.kie.ai" crossorigin />
+<style>
+  :root {
+    --ink:   var(--color-text-primary,   #0f1111);
+    --sub:   var(--color-text-secondary, #5a6270);
+    --line:  var(--color-border-default, #e3e6ea);
+    --card:  var(--color-surface-secondary, #f6f7f9);
+    --accent:var(--color-accent, #2a6df4);
+    --bad:   var(--color-text-error, #b54040);
+    --field: var(--color-surface-primary, #fff);
+  }
+  :root.dark {
+    --ink:   var(--color-text-primary,   #f1f3f5);
+    --sub:   var(--color-text-secondary, #a8b0bc);
+    --line:  var(--color-border-default, #2a2f38);
+    --card:  var(--color-surface-secondary, #1a1d22);
+    --accent:var(--color-accent, #87aaff);
+    --field: var(--color-surface-primary, #0f1216);
+  }
+  html, body { background: transparent; color: var(--ink); margin: 0; }
+  body { font: 14px/1.4 -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto, sans-serif; }
+  .wrap { display: flex; flex-direction: column; gap: 10px; padding: 4px; }
+  .preview {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    overflow: hidden;
+    position: relative;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .preview img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
+  .preview .empty, .preview .err {
+    color: var(--sub); font-size: 13px; padding: 16px; text-align: center;
+  }
+  .preview .err { color: var(--bad); }
+  .preview .spinner {
+    width: 28px; height: 28px;
+    border: 3px solid var(--line);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .meta {
+    display: flex; gap: 10px; font-size: 12px; color: var(--sub);
+    align-items: center; flex-wrap: wrap;
+  }
+  .meta a { color: var(--accent); text-decoration: none; }
+  .meta a:hover { text-decoration: underline; }
+  textarea {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 64px;
+    max-height: 160px;
+    padding: 9px 11px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--field);
+    color: var(--ink);
+    font: inherit;
+    resize: vertical;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  select, button {
+    padding: 7px 11px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--field);
+    color: var(--ink);
+    font: inherit;
+    cursor: pointer;
+  }
+  button.primary {
+    background: var(--accent); color: white; border-color: var(--accent);
+    font-weight: 600; padding: 7px 16px;
+  }
+  button.primary:disabled { opacity: 0.55; cursor: progress; }
+  .hint { color: var(--sub); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="preview" id="preview">
+    <div class="empty">Type a prompt below and click Generate.</div>
+  </div>
+  <div class="meta" id="meta" style="display:none;"></div>
+
+  <textarea id="prompt" placeholder="e.g. Cinematic close-up of a hooded figure in fog, neon highlights, dramatic lighting"></textarea>
+
+  <div class="row">
+    <select id="aspect">
+      <option value="16:9" selected>16:9 (YouTube)</option>
+      <option value="9:16">9:16 (Shorts/Reels)</option>
+      <option value="1:1">1:1 (Square)</option>
+      <option value="4:5">4:5 (Instagram portrait)</option>
+      <option value="3:2">3:2</option>
+    </select>
+    <select id="resolution">
+      <option value="2K" selected>2K</option>
+      <option value="1K">1K</option>
+      <option value="4K">4K</option>
+    </select>
+    <span style="flex:1;"></span>
+    <button class="primary" id="generate">Generate</button>
+  </div>
+
+  <div class="hint">Nano Banana Pro · 3 credits per generation · usually 30–90s</div>
+</div>
+
+<script type="module">
+/*__EXT_APPS_BUNDLE__*/
+const { App, applyHostStyleVariables } = globalThis.ExtApps;
+
+const preview = document.getElementById("preview");
+const meta = document.getElementById("meta");
+const promptEl = document.getElementById("prompt");
+const aspectEl = document.getElementById("aspect");
+const resolutionEl = document.getElementById("resolution");
+const generateBtn = document.getElementById("generate");
+
+function setLoading(state) {
+  if (state) {
+    preview.innerHTML = '<div class="spinner"></div>';
+    generateBtn.disabled = true;
+    generateBtn.textContent = "Generating…";
+  } else {
+    generateBtn.disabled = false;
+    generateBtn.textContent = "Generate";
+  }
+}
+
+function escape(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function render(payload, app) {
+  if (!payload) {
+    preview.innerHTML = `<div class="empty">No data.</div>`;
+    meta.style.display = "none";
+    return;
+  }
+  // Restore the prompt the user submitted so subsequent edits start from it.
+  if (payload.prompt && !promptEl.value) promptEl.value = payload.prompt;
+  if (payload.aspect_ratio) aspectEl.value = payload.aspect_ratio;
+  if (payload.resolution) resolutionEl.value = payload.resolution;
+
+  if (payload.error) {
+    preview.innerHTML = `<div class="err">${escape(payload.error)}</div>`;
+    meta.style.display = "none";
+    return;
+  }
+  const images = Array.isArray(payload.images) ? payload.images : [];
+  if (images.length === 0) {
+    preview.innerHTML = `<div class="empty">Generation returned no image.</div>`;
+    meta.style.display = "none";
+    return;
+  }
+  const url = images[0];
+  preview.innerHTML = `<img src="${escape(url)}" referrerpolicy="no-referrer" alt="generated thumbnail">`;
+  preview.querySelector("img").addEventListener("click", () => {
+    app.openLink({ url }).catch(() => {});
+  });
+
+  const bits = [];
+  if (payload.aspect_ratio) bits.push(payload.aspect_ratio);
+  if (payload.resolution) bits.push(payload.resolution);
+  if (payload.cost_time_s != null) bits.push(`${Number(payload.cost_time_s).toFixed(1)}s`);
+  bits.push(`<a href="${escape(url)}" data-open>Open full size</a>`);
+  meta.innerHTML = bits.join(" · ");
+  meta.style.display = "flex";
+  meta.querySelectorAll("a[data-open]").forEach((a) => {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      app.openLink({ url: a.getAttribute("href") }).catch(() => {});
+    });
+  });
+}
+
+function applyHostContext(ctx) {
+  document.documentElement.classList.toggle("dark", ctx?.theme === "dark");
+  if (ctx?.styles?.variables && typeof applyHostStyleVariables === "function") {
+    applyHostStyleVariables(ctx.styles.variables);
+  }
+}
+
+(async () => {
+  const app = new App({ name: "ThumbnailStudio", version: "1.0.0" }, {}, { autoResize: true });
+
+  app.ontoolresult = ({ content }) => {
+    try {
+      const text = content?.[0]?.text ?? "";
+      const data = text ? JSON.parse(text) : null;
+      render(data, app);
+    } catch (err) {
+      preview.innerHTML = `<div class="err">Bad payload: ${escape(err.message)}</div>`;
+    }
+  };
+  app.onhostcontextchanged = applyHostContext;
+
+  generateBtn.addEventListener("click", async () => {
+    const prompt = promptEl.value.trim();
+    if (!prompt) {
+      promptEl.focus();
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await app.callServerTool({
+        name: "generate_thumbnail",
+        arguments: {
+          prompt,
+          aspect_ratio: aspectEl.value,
+          resolution: resolutionEl.value,
+        },
+      });
+      // callServerTool returns the tool's content; route it through the
+      // same renderer so the result/error path is identical to ontoolresult.
+      const text = res?.content?.[0]?.text ?? "";
+      const data = text ? JSON.parse(text) : null;
+      render(data, app);
+    } catch (err) {
+      preview.innerHTML = `<div class="err">Request failed: ${escape(err.message)}</div>`;
+    } finally {
+      setLoading(false);
+    }
+  });
+
+  await app.connect();
+  applyHostContext(app.getHostContext());
+})();
+</script>
+</body>
+</html>
