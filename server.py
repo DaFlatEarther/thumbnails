@@ -26,7 +26,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 import widgets
-from thumbnails import generate_thumbnail
+from nano_banana_pro import create_task, query_task
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("thumbnails-mcp")
@@ -54,17 +54,29 @@ def _build_mcp() -> FastMCP:
 
     widgets.register(mcp)
 
+    # The image-generation flow is split in two so neither MCP call sits
+    # blocking long enough to trip the host's ~2-minute tool-call timeout:
+    #
+    #   1. generate_thumbnail — submits to Kie and returns the task_id in
+    #      <1s. Widget receives {state:"pending", task_id} and starts polling.
+    #   2. check_thumbnail_status — looks up a task_id, returns current state.
+    #      Widget calls this every few seconds via app.callServerTool until
+    #      state is "success" or "fail".
+    #
+    # Both tools point at the same widget resource so the host renders the
+    # same iframe either way.
+
     @mcp.tool(
         name="generate_thumbnail",
         title="Generate Thumbnail",
         description=(
-            "Generate a thumbnail image from a text prompt using Nano Banana Pro "
-            "(Google's Gemini 2.5 Flash Image). Opens an interactive preview widget "
-            "where the user can refine the prompt and regenerate. Default aspect "
+            "Submit a thumbnail generation request to Nano Banana Pro (Google's "
+            "Gemini 2.5 Flash Image). Returns immediately with a task_id; the "
+            "inline widget polls for the result automatically. Default aspect "
             "ratio is 16:9 (YouTube). Costs 3 Kie credits per generation; usually "
-            "returns in 30–90 seconds. Use this for any request to make/design/draft "
-            "a thumbnail, cover image, or hero image — anything the user wants to "
-            "see and iterate on visually."
+            "finishes in 30–90 seconds. Use this for any request to make/design/"
+            "draft a thumbnail, cover image, or hero image — anything the user "
+            "wants to see and iterate on visually."
         ),
         meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
     )
@@ -74,25 +86,78 @@ def _build_mcp() -> FastMCP:
         resolution: Annotated[str, "1K / 2K / 4K. Default 2K — plenty for thumbnails and ~4× faster than 4K."] = "2K",
         reference_images: Annotated[list[str] | None, "Optional list of up to 8 public image URLs to use as visual references (style, characters, composition)."] = None,
     ) -> str:
-        """Synchronous wrapper — submits to Kie, polls until done, returns the
-        rendered widget's data payload as a compact JSON string."""
         import json
 
-        result = generate_thumbnail(
-            prompt,
-            reference_images=reference_images,
+        submit = create_task(
+            prompt=prompt,
             aspect_ratio=aspect_ratio,
             resolution=resolution,
+            image_input=reference_images or None,
         )
-        # Echo the prompt + settings back so the widget can populate its form
-        # state on re-render (the host pipes this whole payload into the iframe
-        # via ontoolresult).
+
         payload = {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
-            **result,
         }
+        if submit.get("success"):
+            payload.update({
+                "state": "pending",
+                "task_id": submit["task_id"],
+                "model": submit.get("model"),
+            })
+        else:
+            payload.update({
+                "state": "fail",
+                "error": submit.get("error") or "Failed to submit task",
+            })
+        return json.dumps(payload, default=str)
+
+    @mcp.tool(
+        name="check_thumbnail_status",
+        title="Check Thumbnail Status",
+        description=(
+            "Look up the status of a thumbnail generation task by its task_id. "
+            "The widget calls this on a loop while a generation is in flight; "
+            "Claude shouldn't normally need to call it directly."
+        ),
+        meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
+    )
+    async def check_thumbnail_status_tool(
+        task_id: Annotated[str, "The task_id returned by generate_thumbnail."],
+        prompt: Annotated[str, "Original prompt (echoed back to the widget so its form state is preserved across polls)."] = "",
+        aspect_ratio: Annotated[str, "Echoed back to the widget."] = "16:9",
+        resolution: Annotated[str, "Echoed back to the widget."] = "2K",
+    ) -> str:
+        import json
+
+        status = query_task(task_id)
+        payload = {
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "task_id": task_id,
+        }
+        if not status.get("success"):
+            # Transient query error — keep widget in pending so it retries
+            payload["state"] = "pending"
+            payload["transient_error"] = status.get("error")
+            return json.dumps(payload, default=str)
+
+        state = status.get("state")
+        if state == "success":
+            payload["state"] = "success"
+            payload["images"] = status.get("images", [])
+            cost_ms = status.get("cost_time")
+            if cost_ms is not None:
+                payload["cost_time_s"] = round(cost_ms / 1000, 1)
+        elif state == "fail":
+            payload["state"] = "fail"
+            payload["error"] = status.get("error") or "Generation failed"
+            payload["fail_code"] = status.get("fail_code")
+        else:
+            payload["state"] = "pending"
+            payload["upstream_state"] = state
         return json.dumps(payload, default=str)
 
     return mcp

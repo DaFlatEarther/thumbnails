@@ -147,7 +147,69 @@ function escape(s) {
   ));
 }
 
-function render(payload, app) {
+// While a generation is in flight the widget polls check_thumbnail_status.
+// We track the active task and a timer so a brand-new generation cancels
+// the previous poller (e.g. user hits Generate again before the first one
+// finishes).
+let activePollTaskId = null;
+let pollTimer = null;
+const POLL_INTERVAL_MS = 3000;
+const MAX_POLL_S = 300;   // hard ceiling — Nano Banana Pro should be well
+                          // under 90s; this just prevents a runaway loop
+                          // if Kie gets stuck.
+
+function stopPolling() {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+  activePollTaskId = null;
+}
+
+function startPolling(taskId, app, opts) {
+  activePollTaskId = taskId;
+  const start = Date.now();
+
+  async function tick() {
+    if (activePollTaskId !== taskId) return;  // superseded by a newer gen
+    if ((Date.now() - start) / 1000 > MAX_POLL_S) {
+      stopPolling();
+      preview.innerHTML = `<div class="err">Timed out waiting for Kie (>${MAX_POLL_S}s)</div>`;
+      setLoading(false);
+      return;
+    }
+    try {
+      const res = await app.callServerTool({
+        name: "check_thumbnail_status",
+        arguments: {
+          task_id: taskId,
+          prompt: opts.prompt || "",
+          aspect_ratio: opts.aspect_ratio || "16:9",
+          resolution: opts.resolution || "2K",
+        },
+      });
+      const text = res?.content?.[0]?.text ?? "";
+      const data = text ? JSON.parse(text) : null;
+      if (activePollTaskId !== taskId) return;
+      if (data?.state === "success" || data?.state === "fail") {
+        stopPolling();
+        render(data, app);
+        setLoading(false);
+        return;
+      }
+      // Still pending — render the latest payload (keeps spinner) and
+      // schedule the next poll.
+      render(data, app, { keepLoading: true });
+      pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
+    } catch (err) {
+      // Network/host hiccup — keep trying; the host-side timeout cap
+      // applies per call so a single failure isn't fatal.
+      pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
+    }
+  }
+
+  pollTimer = setTimeout(tick, POLL_INTERVAL_MS);
+}
+
+function render(payload, app, opts = {}) {
   if (!payload) {
     preview.innerHTML = `<div class="empty">No data.</div>`;
     meta.style.display = "none";
@@ -158,15 +220,36 @@ function render(payload, app) {
   if (payload.aspect_ratio) aspectEl.value = payload.aspect_ratio;
   if (payload.resolution) resolutionEl.value = payload.resolution;
 
-  if (payload.error) {
-    preview.innerHTML = `<div class="err">${escape(payload.error)}</div>`;
+  // Generation in flight — show spinner and start (or keep) polling.
+  if (payload.state === "pending" && payload.task_id) {
+    preview.innerHTML = '<div class="spinner"></div>';
     meta.style.display = "none";
+    setLoading(true);
+    if (activePollTaskId !== payload.task_id) {
+      stopPolling();
+      startPolling(payload.task_id, app, {
+        prompt: payload.prompt,
+        aspect_ratio: payload.aspect_ratio,
+        resolution: payload.resolution,
+      });
+    }
+    return;
+  }
+
+  // Terminal states — stop any poller and render result/error.
+  stopPolling();
+
+  if (payload.state === "fail" || payload.error) {
+    preview.innerHTML = `<div class="err">${escape(payload.error || "Generation failed")}</div>`;
+    meta.style.display = "none";
+    setLoading(false);
     return;
   }
   const images = Array.isArray(payload.images) ? payload.images : [];
   if (images.length === 0) {
     preview.innerHTML = `<div class="empty">Generation returned no image.</div>`;
     meta.style.display = "none";
+    setLoading(false);
     return;
   }
   const url = images[0];
@@ -188,6 +271,7 @@ function render(payload, app) {
       app.openLink({ url: a.getAttribute("href") }).catch(() => {});
     });
   });
+  setLoading(false);
 }
 
 function applyHostContext(ctx) {
