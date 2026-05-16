@@ -37,6 +37,44 @@ logger = logging.getLogger("thumbnails-mcp")
 _REQUIRED_TOKEN = os.environ.get("THUMBNAILS_MCP_TOKEN", "").strip() or None
 
 
+# Pattern → friendly rewrite. Kie surfaces upstream Gemini errors verbatim,
+# and most users don't know what "Generative AI Prohibited Use policy" means
+# in practice. Map the ones we see in the wild to actionable hints; fall
+# through to the raw message for anything we haven't classified yet.
+_FRIENDLY_ERROR_PATTERNS = (
+    (
+        ("prohibited use policy", "filtered out", "violated google"),
+        "Gemini's safety filter blocked this prompt — usually because of a named "
+        "character, celebrity, brand, or franchise. Try a generic descriptor "
+        "(e.g. \"web-slinging hero\" instead of \"Spider-Man\") and regenerate.",
+    ),
+    (
+        ("rate limit", "too many requests", "429"),
+        "Kie is rate-limiting us — too many generations in flight. Wait ~30s and try again.",
+    ),
+    (
+        ("insufficient credits", "not enough credits", "credit balance"),
+        "Out of Kie credits. Top up at https://kie.ai before generating more thumbnails.",
+    ),
+    (
+        ("service unavailable", "503", "under maintenance"),
+        "Kie / Gemini is temporarily unavailable. Try again in a minute.",
+    ),
+)
+
+
+def _friendly_error(raw: str | None) -> str:
+    """Rewrite a known upstream error string into something a user can act on.
+    Returns the raw string unchanged if no pattern matches."""
+    if not raw:
+        return "Generation failed (no detail provided by upstream)."
+    low = raw.lower()
+    for needles, friendly in _FRIENDLY_ERROR_PATTERNS:
+        if any(n in low for n in needles):
+            return friendly
+    return raw
+
+
 def _build_mcp() -> FastMCP:
     mcp = FastMCP(
         "thumbnails",
@@ -109,7 +147,8 @@ def _build_mcp() -> FastMCP:
         else:
             payload.update({
                 "state": "fail",
-                "error": submit.get("error") or "Failed to submit task",
+                "error": _friendly_error(submit.get("error") or "Failed to submit task"),
+                "raw_error": submit.get("error"),
             })
         return json.dumps(payload, default=str)
 
@@ -153,7 +192,8 @@ def _build_mcp() -> FastMCP:
                 payload["cost_time_s"] = round(cost_ms / 1000, 1)
         elif state == "fail":
             payload["state"] = "fail"
-            payload["error"] = status.get("error") or "Generation failed"
+            payload["error"] = _friendly_error(status.get("error") or "Generation failed")
+            payload["raw_error"] = status.get("error")
             payload["fail_code"] = status.get("fail_code")
         else:
             payload["state"] = "pending"
