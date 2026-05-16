@@ -313,12 +313,16 @@ function applyHostContext(ctx) {
       });
       // callServerTool returns the tool's content; route it through the
       // same renderer so the result/error path is identical to ontoolresult.
+      // render() decides whether to keep the button disabled (pending →
+      // polling) or re-enable it (success/fail/no-image). DO NOT
+      // setLoading(false) here in a finally — that would re-enable the
+      // button while a poll is still in flight, letting a spam-clicker
+      // submit a new Kie task (3 credits each) on every click.
       const text = res?.content?.[0]?.text ?? "";
       const data = text ? JSON.parse(text) : null;
       render(data, app);
     } catch (err) {
       preview.innerHTML = `<div class="err">Request failed: ${escape(err.message)}</div>`;
-    } finally {
       setLoading(false);
     }
   });
