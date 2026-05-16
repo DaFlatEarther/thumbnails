@@ -88,6 +88,45 @@
   }
   button.primary:disabled { opacity: 0.55; cursor: progress; }
   .hint { color: var(--sub); font-size: 12px; }
+  .ref-toggle {
+    color: var(--accent);
+    background: transparent;
+    border: none;
+    padding: 0;
+    font: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+  .ref-toggle:hover { text-decoration: underline; }
+  .ref-box {
+    border: 1px dashed var(--line);
+    border-radius: 8px;
+    padding: 8px;
+    background: var(--card);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .ref-box textarea {
+    min-height: 48px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+  }
+  .ref-thumbs {
+    display: flex; flex-wrap: wrap; gap: 6px;
+  }
+  .ref-thumb {
+    position: relative;
+    width: 96px; height: 54px;          /* 16:9 mini preview */
+    border-radius: 6px;
+    overflow: hidden;
+    background: #000;
+    border: 1px solid var(--line);
+  }
+  .ref-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .ref-thumb .badge {
+    position: absolute; top: 2px; left: 2px;
+    background: rgba(0,0,0,0.6); color: #fff;
+    font-size: 10px; padding: 1px 4px; border-radius: 3px;
+  }
 </style>
 </head>
 <body>
@@ -98,6 +137,12 @@
   <div class="meta" id="meta" style="display:none;"></div>
 
   <textarea id="prompt" placeholder="e.g. Cinematic close-up of a hooded figure in fog, neon highlights, dramatic lighting"></textarea>
+
+  <button class="ref-toggle" id="ref-toggle" type="button">+ Add reference images (YouTube URLs or image URLs)</button>
+  <div class="ref-box" id="ref-box" style="display:none;">
+    <textarea id="ref-urls" placeholder="One per line. Examples:&#10;https://youtube.com/watch?v=...&#10;https://youtu.be/...&#10;https://i.ytimg.com/vi/.../hqdefault.jpg&#10;https://example.com/style.png&#10;&#10;Tip: combine with the algrow MCP — call search_viral_videos / find_outlier_faceless_channels and paste the winning thumbnails here."></textarea>
+    <div class="ref-thumbs" id="ref-thumbs"></div>
+  </div>
 
   <div class="row">
     <select id="aspect">
@@ -129,6 +174,52 @@ const promptEl = document.getElementById("prompt");
 const aspectEl = document.getElementById("aspect");
 const resolutionEl = document.getElementById("resolution");
 const generateBtn = document.getElementById("generate");
+const refToggle = document.getElementById("ref-toggle");
+const refBox = document.getElementById("ref-box");
+const refUrlsEl = document.getElementById("ref-urls");
+const refThumbsEl = document.getElementById("ref-thumbs");
+
+// Client-side mirror of the server's _resolve_reference_url. Used purely
+// to populate the live thumbnail preview row as the user types — the server
+// re-normalizes on submit, so a bug here is cosmetic, not security.
+const YT_RE = /(?:youtube\.com\/(?:watch\?(?:[^#]*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/;
+const BARE_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+function resolveRef(raw) {
+  const s = (raw || "").trim();
+  if (!s) return null;
+  if (s.includes("i.ytimg.com")) return s;
+  const m = s.match(YT_RE);
+  if (m) return `https://i.ytimg.com/vi/${m[1]}/hqdefault.jpg`;
+  if (BARE_ID_RE.test(s)) return `https://i.ytimg.com/vi/${s}/hqdefault.jpg`;
+  if (/^https?:\/\//.test(s)) return s;
+  return null;
+}
+function parseRefUrls() {
+  const lines = (refUrlsEl?.value || "").split(/[\n,]+/);
+  const out = [];
+  const seen = new Set();
+  for (const line of lines) {
+    const r = resolveRef(line);
+    if (r && !seen.has(r)) {
+      seen.add(r);
+      out.push(r);
+      if (out.length >= 8) break;
+    }
+  }
+  return out;
+}
+function renderRefThumbs() {
+  if (!refThumbsEl) return;
+  const urls = parseRefUrls();
+  refThumbsEl.innerHTML = "";
+  urls.forEach((u, i) => {
+    const wrap = document.createElement("div");
+    wrap.className = "ref-thumb";
+    wrap.title = u;
+    wrap.innerHTML = `<img src="${escape(u)}" referrerpolicy="no-referrer" alt=""><div class="badge">#${i + 1}</div>`;
+    refThumbsEl.appendChild(wrap);
+  });
+}
 
 function setLoading(state) {
   if (state) {
@@ -184,6 +275,7 @@ function startPolling(taskId, app, opts) {
           prompt: opts.prompt || "",
           aspect_ratio: opts.aspect_ratio || "16:9",
           resolution: opts.resolution || "2K",
+          reference_urls: opts.reference_urls || [],
         },
       });
       const text = res?.content?.[0]?.text ?? "";
@@ -220,6 +312,19 @@ function render(payload, app, opts = {}) {
   if (payload.aspect_ratio) aspectEl.value = payload.aspect_ratio;
   if (payload.resolution) resolutionEl.value = payload.resolution;
 
+  // If the server told us about references it resolved, mirror them into
+  // the textarea + thumbnails so the user sees what's being passed to Kie
+  // (covers the case where the host pipes a tool result in via ontoolresult
+  // from a Claude-initiated call, not the widget's own Generate click).
+  if (Array.isArray(payload.reference_urls) && payload.reference_urls.length && refUrlsEl && !refUrlsEl.value) {
+    refUrlsEl.value = payload.reference_urls.join("\n");
+    if (refBox) {
+      refBox.style.display = "flex";
+      if (refToggle) refToggle.textContent = "– Hide reference images";
+    }
+    renderRefThumbs();
+  }
+
   // Generation in flight — show spinner and start (or keep) polling.
   if (payload.state === "pending" && payload.task_id) {
     preview.innerHTML = '<div class="spinner"></div>';
@@ -231,6 +336,7 @@ function render(payload, app, opts = {}) {
         prompt: payload.prompt,
         aspect_ratio: payload.aspect_ratio,
         resolution: payload.resolution,
+        reference_urls: payload.reference_urls,
       });
     }
     return;
@@ -295,6 +401,22 @@ function applyHostContext(ctx) {
   };
   app.onhostcontextchanged = applyHostContext;
 
+  // Reference URL section — toggle + live thumbnail previews.
+  if (refToggle && refBox) {
+    refToggle.addEventListener("click", () => {
+      const open = refBox.style.display !== "none";
+      refBox.style.display = open ? "none" : "flex";
+      refToggle.textContent = open
+        ? "+ Add reference images (YouTube URLs or image URLs)"
+        : "– Hide reference images";
+      if (!open) refUrlsEl?.focus();
+    });
+  }
+  if (refUrlsEl) {
+    refUrlsEl.addEventListener("input", renderRefThumbs);
+    refUrlsEl.addEventListener("paste", () => setTimeout(renderRefThumbs, 0));
+  }
+
   generateBtn.addEventListener("click", async () => {
     const prompt = promptEl.value.trim();
     if (!prompt) {
@@ -303,13 +425,17 @@ function applyHostContext(ctx) {
     }
     setLoading(true);
     try {
+      const args = {
+        prompt,
+        aspect_ratio: aspectEl.value,
+        resolution: resolutionEl.value,
+      };
+      const refs = parseRefUrls();
+      if (refs.length) args.reference_urls = refs;
+
       const res = await app.callServerTool({
         name: "generate_thumbnail",
-        arguments: {
-          prompt,
-          aspect_ratio: aspectEl.value,
-          resolution: resolutionEl.value,
-        },
+        arguments: args,
       });
       // callServerTool returns the tool's content; route it through the
       // same renderer so the result/error path is identical to ontoolresult.

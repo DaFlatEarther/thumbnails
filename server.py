@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from typing import Annotated
 
@@ -61,6 +62,68 @@ _FRIENDLY_ERROR_PATTERNS = (
         "Kie / Gemini is temporarily unavailable. Try again in a minute.",
     ),
 )
+
+
+# Reference URLs accepted by generate_thumbnail. The widget surface is a
+# free-text input where users paste whatever they have — YouTube watch
+# links, shorts URLs, raw video IDs, or direct image URLs. We normalize
+# server-side so the agent and the widget don't both need URL-parsing
+# logic. Plays well with algrow MCP: Claude can call
+# search_viral_videos / find_outlier_faceless_channels on the algrow side
+# and pass any `thumbnail_url` (or the watch URL the user copies from a
+# browser) straight through here.
+_YT_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:[^#]*&)?v=|shorts/|embed/|live/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{11})"
+)
+_BARE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def _resolve_reference_url(url: str) -> str | None:
+    """Normalize one reference input.
+
+      - YouTube watch / shorts / embed / live / youtu.be URL → hqdefault.jpg
+      - Bare 11-char video ID → hqdefault.jpg
+      - Already an i.ytimg.com URL → passed through
+      - Any other http(s):// URL → passed through (assumed image)
+      - Anything else → None (caller drops it)
+
+    hqdefault.jpg is always present for any public video and is a fine
+    visual reference for Gemini even though maxresdefault exists for some
+    — picking maxresdefault would 404 unpredictably for older / less
+    popular videos and break the whole submit.
+    """
+    s = (url or "").strip()
+    if not s:
+        return None
+    if "i.ytimg.com" in s:
+        return s
+    m = _YT_ID_RE.search(s)
+    if m:
+        return f"https://i.ytimg.com/vi/{m.group(1)}/hqdefault.jpg"
+    if _BARE_ID_RE.match(s):
+        return f"https://i.ytimg.com/vi/{s}/hqdefault.jpg"
+    if s.startswith(("http://", "https://")):
+        return s
+    return None
+
+
+def _resolve_reference_urls(urls: list[str] | None) -> list[str]:
+    """Resolve and dedupe a list of reference inputs. Caps at 8 (Kie's limit)."""
+    if not urls:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        # The widget sends one string per line; also accept comma-separated.
+        for piece in re.split(r"[\n,]+", raw or ""):
+            r = _resolve_reference_url(piece)
+            if r and r not in seen:
+                seen.add(r)
+                out.append(r)
+                if len(out) >= 8:
+                    return out
+    return out
 
 
 def _friendly_error(raw: str | None) -> str:
@@ -112,9 +175,18 @@ def _build_mcp() -> FastMCP:
             "Gemini 2.5 Flash Image). Returns immediately with a task_id; the "
             "inline widget polls for the result automatically. Default aspect "
             "ratio is 16:9 (YouTube). Costs 3 Kie credits per generation; usually "
-            "finishes in 30–90 seconds. Use this for any request to make/design/"
-            "draft a thumbnail, cover image, or hero image — anything the user "
-            "wants to see and iterate on visually."
+            "finishes in 30–90 seconds.\n\n"
+            "Use this for any request to make/design/draft a thumbnail, cover "
+            "image, or hero image — anything the user wants to see and iterate "
+            "on visually.\n\n"
+            "Reference images work powerfully — pass up to 8 URLs via "
+            "`reference_urls` (YouTube watch/shorts/embed/live URLs, raw 11-char "
+            "video IDs, i.ytimg.com URLs, and direct image URLs are all accepted; "
+            "the server normalizes them). Composes well with the algrow MCP "
+            "(https://mcp.algrow.online): call algrow's search_viral_videos or "
+            "find_outlier_faceless_channels first, then pass the resulting "
+            "`thumbnail_url`s here as references so Gemini mimics what's already "
+            "winning in that niche."
         ),
         meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
     )
@@ -122,21 +194,27 @@ def _build_mcp() -> FastMCP:
         prompt: Annotated[str, "Description of the thumbnail to generate. Be specific about subject, style, mood, and composition — Nano Banana Pro renders detail well."],
         aspect_ratio: Annotated[str, "16:9 / 9:16 / 1:1 / 4:5 / 4:3 / 3:2 / 21:9 / auto. Default 16:9 (YouTube thumbnail)."] = "16:9",
         resolution: Annotated[str, "1K / 2K / 4K. Default 2K — plenty for thumbnails and ~4× faster than 4K."] = "2K",
-        reference_images: Annotated[list[str] | None, "Optional list of up to 8 public image URLs to use as visual references (style, characters, composition)."] = None,
+        reference_urls: Annotated[list[str] | None, "Up to 8 reference inputs. Each can be a YouTube URL (watch / shorts / youtu.be / embed / live), a bare 11-char video ID, an i.ytimg.com URL, or any direct image URL. YouTube URLs are auto-resolved to the video's hqdefault thumbnail server-side."] = None,
+        reference_images: Annotated[list[str] | None, "Alias for `reference_urls`, accepted for back-compat. Prefer reference_urls in new code."] = None,
     ) -> str:
         import json
+
+        # Merge & normalize whatever the caller provided.
+        combined = list(reference_urls or []) + list(reference_images or [])
+        resolved_refs = _resolve_reference_urls(combined)
 
         submit = create_task(
             prompt=prompt,
             aspect_ratio=aspect_ratio,
             resolution=resolution,
-            image_input=reference_images or None,
+            image_input=resolved_refs or None,
         )
 
         payload = {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
+            "reference_urls": resolved_refs,
         }
         if submit.get("success"):
             payload.update({
@@ -167,6 +245,7 @@ def _build_mcp() -> FastMCP:
         prompt: Annotated[str, "Original prompt (echoed back to the widget so its form state is preserved across polls)."] = "",
         aspect_ratio: Annotated[str, "Echoed back to the widget."] = "16:9",
         resolution: Annotated[str, "Echoed back to the widget."] = "2K",
+        reference_urls: Annotated[list[str] | None, "Echoed back to the widget so the reference thumbnails stay visible during polling."] = None,
     ) -> str:
         import json
 
@@ -176,6 +255,7 @@ def _build_mcp() -> FastMCP:
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
             "task_id": task_id,
+            "reference_urls": reference_urls or [],
         }
         if not status.get("success"):
             # Transient query error — keep widget in pending so it retries

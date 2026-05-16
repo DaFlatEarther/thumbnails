@@ -44,6 +44,30 @@ CLI smoke test:
 python thumbnails.py "a cat in a spacesuit, octane render"
 ```
 
+## Combine with [algrow MCP](https://mcp.algrow.online) for niche-aware references
+
+If you connect both `thumbnails-mcp` and the [algrow MCP](https://mcp.algrow.online) in the
+same Claude conversation, you can ask things like:
+
+> *"Find the top 5 viral gaming shorts from this week and generate me a
+> thumbnail in that style for a video called 'I built a city in Minecraft'."*
+
+Claude will call algrow's `search_viral_videos` / `find_outlier_faceless_channels`
+to pull the winning thumbnails for that niche, then feed those URLs into
+`generate_thumbnail` via `reference_urls`. Nano Banana Pro uses them as
+visual references — composition, color palette, text treatment — and
+produces something tuned to what's already over-performing in that space.
+
+Why this works: algrow tracks 50k+ channels with outlier scores; thumbnails
+benefits from Nano Banana's quality. Together you get *"thumbnails that
+look like the niche's top performers"* without a designer.
+
+Same flow works for **a single YouTube link** the user pastes: drop the
+URL into the reference field (or pass it via `reference_urls`), the server
+auto-resolves it to that video's thumbnail and feeds it to Gemini as a
+reference. Accepts watch URLs, shorts URLs, youtu.be, embed, live, raw
+11-char video IDs, and direct image URLs.
+
 ## Use as an MCP server (widget mode)
 
 ### Run locally
