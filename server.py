@@ -146,7 +146,18 @@ class CorsMiddleware:
 
 
 class AuthMiddleware:
-    """If THUMBNAILS_MCP_TOKEN is set, require it as a Bearer token on /mcp."""
+    """If THUMBNAILS_MCP_TOKEN is set, require it on /mcp via EITHER:
+
+      - HTTP header:  Authorization: Bearer <token>
+      - Query string: ?key=<token>
+
+    The query-string form exists because claude.ai's "Add custom connector"
+    dialog only accepts a URL + OAuth (no Authorization header field). Pasting
+    `https://host/mcp?key=<token>` lets the connector authenticate without
+    standing up a full OAuth flow. Header form is preferred for everything
+    else (curl, Claude Desktop via mcp-remote --header, etc.) because query
+    strings get logged.
+    """
 
     def __init__(self, app):
         self.app = app
@@ -159,9 +170,18 @@ class AuthMiddleware:
         if not path.startswith("/mcp"):
             await self.app(scope, receive, send)
             return
+
         headers = dict(scope.get("headers", []))
         auth = headers.get(b"authorization", b"").decode()
-        if not auth.startswith("Bearer ") or auth[7:].strip() != _REQUIRED_TOKEN:
+        header_token = auth[7:].strip() if auth.startswith("Bearer ") else None
+
+        # Parse ?key=… from the raw query string (ASGI exposes it as bytes).
+        query = scope.get("query_string", b"").decode()
+        from urllib.parse import parse_qs
+        query_token = (parse_qs(query).get("key") or [None])[0]
+
+        supplied = header_token or query_token
+        if supplied != _REQUIRED_TOKEN:
             await JSONResponse(
                 {"error": "unauthorized"}, status_code=401
             )(scope, receive, send)
