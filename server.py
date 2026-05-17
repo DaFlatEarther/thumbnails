@@ -325,6 +325,13 @@ def _build_mcp() -> FastMCP:
                 content_type = "longform"
 
             try:
+                # 90s timeout — algrow's outlier_score + search-query path
+                # runs an embedding lookup + vector search that takes
+                # 25–60s in practice (measured 2026-05-17: Amazon Prime,
+                # Minecraft, iPhone review queries all 40s+; cooking
+                # recipe came back in 28s). claude.ai's MCP host caps
+                # tool calls at ~2 min, so 90s gives algrow headroom
+                # while leaving slack for our own overhead.
                 resp = requests.post(
                     f"{_ALGROW_API_BASE}/api/viral-videos/search",
                     headers={
@@ -338,9 +345,16 @@ def _build_mcp() -> FastMCP:
                         "per_page": limit,
                         "min_outlier_score": min_outlier_score,
                     },
-                    timeout=15,
+                    timeout=90,
                 )
                 data = resp.json() if resp.content else {}
+            except requests.exceptions.Timeout:
+                return json.dumps({
+                    "view": "outlier_picker",
+                    "topic": topic,
+                    "outliers": [],
+                    "error": "Algrow's outlier search timed out (>90s). Try a more specific topic or try again — their semantic search can be cold on first hit.",
+                })
             except Exception as e:
                 logger.warning(f"algrow API call failed: {e}")
                 return json.dumps({

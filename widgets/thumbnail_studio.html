@@ -592,8 +592,16 @@ function applyHostContext(ctx) {
         return;
       }
       outliersSection.style.display = "flex";
-      outliersMeta.textContent = "searching…";
-      outliersGrid.innerHTML = '<div class="spinner" style="margin:12px;"></div>';
+      outliersMeta.textContent = "searching algrow…";
+      // Algrow's semantic outlier search can take 30–60s, occasionally
+      // longer. Show the spinner + a "this takes a while" hint so the
+      // user doesn't think the widget hung.
+      outliersGrid.innerHTML = (
+        '<div style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px;">' +
+        '<div class="spinner"></div>' +
+        '<div class="hint">Searching algrow… 30–60s on cold queries.</div>' +
+        '</div>'
+      );
       try {
         const res = await app.callServerTool({
           name: "find_outlier_references",
