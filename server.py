@@ -19,6 +19,7 @@ import re
 from collections.abc import AsyncIterator
 from typing import Annotated
 
+import requests
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -36,6 +37,14 @@ logger = logging.getLogger("thumbnails-mcp")
 # /mcp. If unset, the server is open (fine for local dev / self-hosting; not
 # recommended for any deployment that pays for Kie credits).
 _REQUIRED_TOKEN = os.environ.get("THUMBNAILS_MCP_TOKEN", "").strip() or None
+
+# Optional algrow integration — when set, the find_outlier_references tool
+# is enabled and the widget shows a "Find outliers" button. The tool calls
+# algrow's public viral-videos search endpoint to surface high-outlier-score
+# thumbnails for any topic, which users can pick as references for
+# generation.
+_ALGROW_API_KEY = os.environ.get("ALGROW_API_KEY", "").strip() or None
+_ALGROW_API_BASE = (os.environ.get("ALGROW_API_BASE_URL") or "https://api.algrow.online").rstrip("/")
 
 
 # Pattern → friendly rewrite. Kie surfaces upstream Gemini errors verbatim,
@@ -279,6 +288,101 @@ def _build_mcp() -> FastMCP:
             payload["state"] = "pending"
             payload["upstream_state"] = state
         return json.dumps(payload, default=str)
+
+    # ----- Optional algrow-powered outlier picker --------------------------
+    # Only registered when ALGROW_API_KEY is configured. Lets the widget (and
+    # Claude, when called from chat) pull high-outlier-score thumbnails for a
+    # topic and offer them as references — same UX a competitor product
+    # ships, but powered by algrow's 50k+ channel dataset.
+    if _ALGROW_API_KEY:
+        @mcp.tool(
+            name="find_outlier_references",
+            title="Find Outlier Thumbnails on a Topic",
+            description=(
+                "Search algrow's database (50k+ YouTube channels) for high-"
+                "outlier-score videos on a topic and return their thumbnails as "
+                "candidate references for thumbnail generation. The widget "
+                "renders the results as a clickable grid — users tap one or "
+                "more to add them to the generation's reference_urls list.\n\n"
+                "Outlier score = video.view_count / channel.avg_views_per_video. "
+                "2.5× means the video got 2.5× its channel's typical views — a "
+                "strong signal that the thumbnail/title combo is working. Returns "
+                "sorted by outlier_score descending. Default content_type is "
+                "longform; use shorts for shortform-style references."
+            ),
+            meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
+        )
+        async def find_outlier_references_tool(
+            topic: Annotated[str, "Search topic — the video idea you want references for. Algrow does semantic search so phrases work better than single keywords (e.g. 'Amazon Prime downfall' is better than 'amazon')."],
+            content_type: Annotated[str, "longform or shorts. Default longform."] = "longform",
+            limit: Annotated[int, "Max thumbnails to return. Default 12, capped at 24."] = 12,
+            min_outlier_score: Annotated[float | None, "Optional floor. Only include videos that outperformed their channel average by at least this factor (e.g. 1.5). Leave None to take whatever algrow returns sorted by outlier_score."] = None,
+        ) -> str:
+            import json
+
+            limit = max(1, min(int(limit or 12), 24))
+            if content_type not in ("longform", "shorts"):
+                content_type = "longform"
+
+            try:
+                resp = requests.post(
+                    f"{_ALGROW_API_BASE}/api/viral-videos/search",
+                    headers={
+                        "Authorization": f"Bearer {_ALGROW_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "q": topic,
+                        "content_type": content_type,
+                        "sort_by": "outlier_score",
+                        "per_page": limit,
+                        "min_outlier_score": min_outlier_score,
+                    },
+                    timeout=15,
+                )
+                data = resp.json() if resp.content else {}
+            except Exception as e:
+                logger.warning(f"algrow API call failed: {e}")
+                return json.dumps({
+                    "view": "outlier_picker",
+                    "topic": topic,
+                    "outliers": [],
+                    "error": _friendly_error(str(e)),
+                })
+
+            if resp.status_code != 200 or not data.get("success"):
+                err = data.get("error") or f"algrow returned HTTP {resp.status_code}"
+                return json.dumps({
+                    "view": "outlier_picker",
+                    "topic": topic,
+                    "outliers": [],
+                    "error": _friendly_error(err),
+                })
+
+            # Slim each video down to what the widget actually renders. The
+            # grid uses thumbnail_url + outlier_score + title; url is for
+            # the "open on YouTube" click-through.
+            outliers = []
+            for v in (data.get("videos") or [])[:limit]:
+                outliers.append({
+                    "video_id": v.get("video_id"),
+                    "title": v.get("title") or "",
+                    "thumbnail_url": v.get("thumbnail_url"),
+                    "outlier_score": v.get("outlier_score"),
+                    "channel_name": v.get("channel_name") or "",
+                    "view_count": v.get("view_count"),
+                    "url": v.get("url") or (
+                        f"https://www.youtube.com/watch?v={v.get('video_id')}"
+                        if v.get("video_id") else None
+                    ),
+                })
+
+            return json.dumps({
+                "view": "outlier_picker",
+                "topic": topic,
+                "content_type": content_type,
+                "outliers": outliers,
+            }, default=str)
 
     return mcp
 
