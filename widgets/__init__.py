@@ -74,6 +74,12 @@ THUMBNAIL_STUDIO_CSP = {
         "https://i.ytimg.com",
         "https://yt3.ggpht.com",
         "https://yt3.googleusercontent.com",
+        # Algora's own R2-backed thumbnail mirror — the outlier picker
+        # surfaces algrow's viral_videos rows whose `thumbnail_url` points
+        # here (algora downloads + republishes YouTube thumbs to dodge
+        # hotlink throttling). Without this on the allowlist the outlier
+        # grid renders black boxes.
+        "https://audio.algrow.online",
     ],
     "baseUriDomains": [],
 }
