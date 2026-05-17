@@ -60,10 +60,20 @@ THUMBNAIL_STUDIO_URI = "ui://widgets/thumbnail-studio.html"
 THUMBNAIL_STUDIO_CSP = {
     "connectDomains": [],
     "resourceDomains": [
+        # Kie's image CDNs — where Gemini's generated thumbnails live.
         "https://tempfile.aiquickdraw.com",
         "https://file.aiquickdraw.com",
         "https://cdn.kie.ai",
         "https://kieai.erweima.ai",
+        # YouTube thumbnail CDNs — where reference image previews load from
+        # when the user pastes a YouTube URL (resolver normalizes them to
+        # i.ytimg.com/vi/<id>/hqdefault.jpg). Without this the reference
+        # tiles render as black boxes — generation still works because
+        # Gemini fetches the URL server-side, but the widget preview is
+        # CSP-blocked.
+        "https://i.ytimg.com",
+        "https://yt3.ggpht.com",
+        "https://yt3.googleusercontent.com",
     ],
     "baseUriDomains": [],
 }
