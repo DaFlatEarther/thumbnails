@@ -299,16 +299,24 @@ def _build_mcp() -> FastMCP:
             name="find_outlier_references",
             title="Find Outlier Thumbnails on a Topic",
             description=(
-                "Search algrow's database (50k+ YouTube channels) for high-"
-                "outlier-score videos on a topic and return their thumbnails as "
-                "candidate references for thumbnail generation. The widget "
-                "renders the results as a clickable grid — users tap one or "
-                "more to add them to the generation's reference_urls list.\n\n"
-                "Outlier score = video.view_count / channel.avg_views_per_video. "
-                "2.5× means the video got 2.5× its channel's typical views — a "
-                "strong signal that the thumbnail/title combo is working. Returns "
-                "sorted by outlier_score descending. Default content_type is "
-                "longform; use shorts for shortform-style references."
+                "Search algrow's database (50k+ YouTube channels) for "
+                "topically-similar videos with proven outlier performance "
+                "and return their thumbnails as candidate references for "
+                "thumbnail generation. The widget renders the results as a "
+                "clickable grid — users tap one or more to add them to the "
+                "generation's reference_urls list.\n\n"
+                "Ranking: vector-similarity to the topic, filtered to videos "
+                "with outlier_score >= 2.0 (i.e. the video got at least 2× "
+                "its channel's typical views — a strong signal the thumbnail/"
+                "title combo is working). Outlier score = video.view_count / "
+                "channel.avg_views_per_video.\n\n"
+                "This combination (similarity sort + 2× outlier floor) is "
+                "what produces useful references — sorting by raw outlier "
+                "score surfaces topically-off-target winners (e.g. a "
+                "99× 'Hidden Villages of the Amazon' video for an 'Amazon "
+                "Prime' query), while dropping the floor lets in low-signal "
+                "noise. Default content_type is longform; use shorts for "
+                "shortform-style references."
             ),
             meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
         )
@@ -316,7 +324,7 @@ def _build_mcp() -> FastMCP:
             topic: Annotated[str, "Search topic — the video idea you want references for. Algrow does semantic search so phrases work better than single keywords (e.g. 'Amazon Prime downfall' is better than 'amazon')."],
             content_type: Annotated[str, "longform or shorts. Default longform."] = "longform",
             limit: Annotated[int, "Max thumbnails to return. Default 12, capped at 24."] = 12,
-            min_outlier_score: Annotated[float | None, "Optional floor. Only include videos that outperformed their channel average by at least this factor (e.g. 1.5). Leave None to take whatever algrow returns sorted by outlier_score."] = None,
+            min_outlier_score: Annotated[float, "Floor on outlier multiplier — only include videos that outperformed their channel average by at least this factor. Default 2.0 (validated against hand-eval: lower lets in too much noise, higher misses too many strong references)."] = 2.0,
         ) -> str:
             import json
 
@@ -325,13 +333,19 @@ def _build_mcp() -> FastMCP:
                 content_type = "longform"
 
             try:
-                # 90s timeout — algrow's outlier_score + search-query path
-                # runs an embedding lookup + vector search that takes
-                # 25–60s in practice (measured 2026-05-17: Amazon Prime,
-                # Minecraft, iPhone review queries all 40s+; cooking
-                # recipe came back in 28s). claude.ai's MCP host caps
-                # tool calls at ~2 min, so 90s gives algrow headroom
-                # while leaving slack for our own overhead.
+                # 90s timeout — algrow's similarity sort runs an embedding
+                # lookup + vector search that takes 25–60s in practice
+                # (measured 2026-05-17). claude.ai's MCP host caps tool
+                # calls at ~2 min, so 90s gives algrow headroom while
+                # leaving slack for our own overhead.
+                #
+                # sort_by=similarity is intentional, not outlier_score:
+                # the user wants topically-relevant references first
+                # (otherwise pure outlier sort surfaces "Hidden Villages
+                # of the Amazon" for an "Amazon Prime" query — high
+                # outlier, wrong topic). Then min_outlier_score=2.0
+                # culls weak performers. Validated by hand-eval as the
+                # best signal/noise balance.
                 resp = requests.post(
                     f"{_ALGROW_API_BASE}/api/viral-videos/search",
                     headers={
@@ -341,7 +355,7 @@ def _build_mcp() -> FastMCP:
                     json={
                         "q": topic,
                         "content_type": content_type,
-                        "sort_by": "outlier_score",
+                        "sort_by": "similarity",
                         "per_page": limit,
                         "min_outlier_score": min_outlier_score,
                     },
