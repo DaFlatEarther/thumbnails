@@ -46,6 +46,19 @@ _REQUIRED_TOKEN = os.environ.get("THUMBNAILS_MCP_TOKEN", "").strip() or None
 _ALGROW_API_KEY = os.environ.get("ALGROW_API_KEY", "").strip() or None
 _ALGROW_API_BASE = (os.environ.get("ALGROW_API_BASE_URL") or "https://api.algrow.online").rstrip("/")
 
+# Optional Gemini vision — when set, references get auto-analyzed into a
+# structured JSON breakdown (composition, palette, lighting, text style,
+# etc.) that gets folded into the generation prompt. Massive quality win:
+# Gemini's image-gen alone treats reference_urls as loose visual hints;
+# spelling out the design rules explicitly forces it to keep the layout
+# and only swap the subject content.
+_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip() or None
+_GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-flash").strip()
+_GEMINI_VISION_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{_GEMINI_VISION_MODEL}:generateContent"
+)
+
 
 # Pattern → friendly rewrite. Kie surfaces upstream Gemini errors verbatim,
 # and most users don't know what "Generative AI Prohibited Use policy" means
@@ -71,6 +84,192 @@ _FRIENDLY_ERROR_PATTERNS = (
         "Kie / Gemini is temporarily unavailable. Try again in a minute.",
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Vision-to-JSON: reference image → structured design breakdown
+# ---------------------------------------------------------------------------
+
+_VISION_TO_JSON_PROMPT = """Analyze this YouTube thumbnail and return a structured JSON breakdown describing what makes it work visually. Be specific and concrete — every field should help someone recreate a thumbnail in the same style with different content.
+
+Output ONLY a JSON object matching this schema (no markdown wrapping, no commentary):
+
+{
+  "subject": {
+    "type": "person | object | scene | text-only | mixed",
+    "description": "1 sentence: what's the main subject",
+    "position": "left | center | right | full-frame",
+    "size_proportion": "small | medium | large | dominant",
+    "expression_or_state": "for person: emotion/expression; for object: condition/treatment"
+  },
+  "composition": {
+    "layout": "1 sentence describing element placement (e.g. 'person left occupying 35%, text flanking right, prop bottom right')",
+    "depth_style": "flat | layered_cutout | photographic_depth | composite",
+    "balance": "symmetric | asymmetric_left | asymmetric_right | dynamic"
+  },
+  "text_overlay": {
+    "present": true,
+    "content": "exact visible text",
+    "font_style": "bold_sans | gothic_serif | condensed_display | handwritten | tech_mono | other",
+    "treatment": "shadow | stroke | glow | gradient | none",
+    "position": "top | bottom | left | right | flanking_subject | center",
+    "color": "primary text color"
+  },
+  "color_palette": {
+    "background_color": "dominant bg color",
+    "primary_accent": "main accent color",
+    "secondary_accent": "secondary accent or null",
+    "mood": "warm | cool | dark | bright | high_contrast | muted | neon"
+  },
+  "lighting": {
+    "style": "cinematic | studio | natural | spotlight | flat | dramatic",
+    "direction": "top | front | back | side | rim | ambient",
+    "contrast": "low | medium | high | extreme"
+  },
+  "background": {
+    "type": "solid | gradient | scene | abstract | composite",
+    "description": "1 sentence",
+    "complexity": "minimal | moderate | busy"
+  },
+  "style_genre": "mr_beast | unlayered_creator | editorial_explainer | gaming | luxury_brand | horror | educational | brutalist | tech_review | challenge_series | other",
+  "emotional_cue": "shock | joy | fear | curiosity | intensity | calm | mystery | urgency | conflict",
+  "visual_devices": ["arrow", "circle", "strikethrough", "before_after", "speech_bubble", "money_burst"],
+  "key_props": ["list of significant visible objects"],
+  "what_makes_it_work": "1-2 sentences on the design technique that makes this thumbnail effective"
+}"""
+
+
+def _analyze_image_via_gemini(image_url: str) -> tuple[dict | None, str | None]:
+    """Fetch image bytes, call Gemini vision with the schema prompt, return
+    structured dict. Returns (analysis, error) — analysis is None on error.
+
+    Used by the standalone analyze_thumbnail tool and folded into
+    generate_thumbnail when analyze_references=True.
+    """
+    if not _GEMINI_API_KEY:
+        return None, "Vision analysis disabled (GEMINI_API_KEY not set)."
+
+    try:
+        img_resp = requests.get(image_url, timeout=20)
+        img_resp.raise_for_status()
+        img_bytes = img_resp.content
+        mime_type = (img_resp.headers.get("content-type") or "image/jpeg").split(";")[0].strip()
+        if not mime_type.startswith("image/"):
+            mime_type = "image/jpeg"
+    except Exception as e:
+        return None, f"Couldn't fetch reference image: {str(e)[:140]}"
+
+    import base64 as _b64
+    import json as _json
+
+    try:
+        resp = requests.post(
+            f"{_GEMINI_VISION_URL}?key={_GEMINI_API_KEY}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{
+                    "parts": [
+                        {"text": _VISION_TO_JSON_PROMPT},
+                        {"inline_data": {"mime_type": mime_type, "data": _b64.b64encode(img_bytes).decode("ascii")}},
+                    ],
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "temperature": 0.2,
+                },
+            },
+            timeout=30,
+        )
+    except Exception as e:
+        return None, f"Gemini vision request failed: {str(e)[:140]}"
+
+    if resp.status_code != 200:
+        return None, f"Gemini vision HTTP {resp.status_code}: {resp.text[:200]}"
+
+    try:
+        body = resp.json()
+        text = body["candidates"][0]["content"]["parts"][0]["text"]
+        analysis = _json.loads(text)
+    except Exception as e:
+        return None, f"Couldn't parse Gemini response: {str(e)[:140]}"
+
+    return analysis, None
+
+
+def _analyze_references_parallel(urls: list[str], max_n: int = 3
+                                  ) -> tuple[list[dict], list[str]]:
+    """Run vision analysis on up to `max_n` references in parallel.
+    Returns (analyses, errors) — order matches input order, errors is a list
+    of any failures (skipped on success). Each analysis adds 3–10s on its
+    own; parallel keeps total wall time close to slowest single call.
+    """
+    if not urls or not _GEMINI_API_KEY:
+        return [], []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    picks = urls[:max_n]
+    results: dict[int, tuple[dict | None, str | None]] = {}
+    with ThreadPoolExecutor(max_workers=len(picks)) as pool:
+        futures = {pool.submit(_analyze_image_via_gemini, u): i for i, u in enumerate(picks)}
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as e:
+                results[i] = (None, f"analysis crashed: {str(e)[:120]}")
+    analyses, errors = [], []
+    for i in range(len(picks)):
+        a, err = results.get(i, (None, "missing"))
+        if a is not None:
+            analyses.append(a)
+        elif err:
+            errors.append(err)
+    return analyses, errors
+
+
+def _build_reference_directives(analyses: list[dict]) -> str:
+    """Distill the vision JSON into a few crisp directive bullets that the
+    image-gen model will follow. If multiple analyses, take the first (the
+    'primary' reference) and note that more were considered — averaging
+    palettes / layouts across multiple refs blurs everything to mush, and
+    the user picked an explicit primary by selecting it first.
+    """
+    if not analyses:
+        return ""
+    a = analyses[0]
+    comp = a.get("composition") or {}
+    txt = a.get("text_overlay") or {}
+    palette = a.get("color_palette") or {}
+    light = a.get("lighting") or {}
+    bg = a.get("background") or {}
+
+    devices = a.get("visual_devices") or []
+    props = a.get("key_props") or []
+
+    bullets = [
+        "TEMPLATE TO MATCH (extracted from the user's chosen reference thumbnail — KEEP these design rules, only swap the subject content):",
+        f"• Composition: {comp.get('layout', 'n/a')} (depth: {comp.get('depth_style', 'n/a')}, balance: {comp.get('balance', 'n/a')})",
+        f"• Color palette: background {palette.get('background_color', 'n/a')}, primary accent {palette.get('primary_accent', 'n/a')}"
+        + (f", secondary accent {palette['secondary_accent']}" if palette.get('secondary_accent') else "")
+        + f"; mood {palette.get('mood', 'n/a')}",
+        f"• Lighting: {light.get('style', 'n/a')}, {light.get('direction', 'n/a')} direction, {light.get('contrast', 'n/a')} contrast",
+        f"• Text treatment: {txt.get('font_style', 'n/a')} font, {txt.get('treatment', 'none')} treatment, positioned {txt.get('position', 'n/a')}, color {txt.get('color', 'n/a')}",
+        f"• Background: {bg.get('type', 'n/a')} ({bg.get('complexity', 'n/a')} complexity) — {bg.get('description', 'n/a')}",
+        f"• Style genre: {a.get('style_genre', 'n/a')}",
+        f"• Emotional cue: {a.get('emotional_cue', 'n/a')}",
+    ]
+    if devices:
+        bullets.append(f"• Visual devices to reuse where natural: {', '.join(devices[:5])}")
+    insight = a.get("what_makes_it_work")
+    if insight:
+        bullets.append(f"• Why this template works: {insight}")
+    bullets.append(
+        "CRITICAL: apply the SAME composition, palette, lighting style, text treatment, and overall style genre to the new subject below. The reference's specific subject/props/text content do NOT carry over — only the design system does."
+    )
+    if len(analyses) > 1:
+        bullets.append(
+            f"(Analyzed {len(analyses)} references total; primary template above. Other refs inform palette breadth but the primary's layout/composition wins.)"
+        )
+    return "\n".join(bullets)
 
 
 def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
@@ -266,14 +465,26 @@ _STYLE_PRESETS = {
 }
 
 
-def _compose_prompt(user_prompt: str, preset: str) -> str:
-    """Glue the composition preset onto the user's prompt. The user's intent
-    stays first (so it dominates), the composition rules trail as a styling
-    layer the model treats as constraints."""
+def _compose_prompt(user_prompt: str, preset: str, reference_directives: str = "") -> str:
+    """Glue the composition preset + (optional) reference-template directives
+    onto the user's prompt.
+
+    Final shape:
+      SUBJECT / SCENE: <user prompt>
+      [TEMPLATE TO MATCH: …]   ← only when refs were analyzed
+      [COMPOSITION (preset): …] ← only when preset != "none"
+
+    User intent stays first so it dominates. Reference template comes second
+    because it's the most concrete styling signal (extracted from a real
+    image). Generic preset rules trail last as fallback constraints.
+    """
+    parts = [f"SUBJECT / SCENE:\n{user_prompt.strip()}"]
+    if reference_directives:
+        parts.append(reference_directives)
     style = _STYLE_PRESETS.get(preset or "person_focal", _PERSON_FOCAL_STYLE)
-    if not style:
-        return user_prompt
-    return f"SUBJECT / SCENE:\n{user_prompt.strip()}\n\n{style}"
+    if style:
+        parts.append(style)
+    return "\n\n".join(parts)
 
 
 def _friendly_error(raw: str | None) -> str:
@@ -349,6 +560,7 @@ def _build_mcp() -> FastMCP:
         style_preset: Annotated[str, "Composition preset prepended to the prompt. Pick based on whether the video has a face on camera:\n• 'person_focal' (DEFAULT) — for videos featuring a real on-camera creator. Person on the left, face large/expressive, big text right, cutout depth, cinematic lighting (Unlayered / Pitagoras / MrBeast style).\n• 'faceless' — for videos with NO on-camera person (challenge series, business case studies, explainers, ASMR/cooking close-ups, tier-list style). Dominant centered hero object/scene tells the story via metaphor or juxtaposition; large decorative text; spotlight or editorial lighting; dark bg + single accent color.\n• 'none' — pass prompt verbatim with no composition guidance. Use ONLY when the user has very specific creative direction that would conflict with a preset.\nPick faceless if the video idea doesn't naturally include a person on camera, even if the user didn't say 'faceless' explicitly."] = "person_focal",
         find_outliers_first: Annotated[bool, "Set True to auto-fetch viral references from algrow and use the top 3 as reference_urls, in the SAME call. This produces ONE widget with the result AND the outlier grid (user can pick alternates without re-prompting). Prefer this over calling find_outlier_references separately when the user wants 'a thumbnail with viral references for X' — separate calls mount two widgets and the user can't pick from the grid after the result lands. Best used with `outlier_topic` to keep the algrow search query short (algrow's semantic search is loose on long phrases)."] = False,
         outlier_topic: Annotated[str | None, "Topic to search algrow for when find_outliers_first=True. Defaults to `prompt` if unset, but keeping this short (2-3 words: 'Vietnam rail', 'Amazon Prime', 'Minecraft 100 days') gives much better outlier matches than a full prompt."] = None,
+        analyze_references: Annotated[bool, "When True (default) AND reference_urls are provided, the server first runs Gemini vision on the references to extract a structured design breakdown (composition, palette, lighting, text style, etc.), then folds those template rules into the prompt. Result: Gemini's image-gen keeps the reference's design system but swaps the subject for the user's. Adds 5–15s of latency. Set False to skip and pass references as loose visual hints only."] = True,
     ) -> str:
         import json
 
@@ -372,7 +584,20 @@ def _build_mcp() -> FastMCP:
                     resolved_refs.append(tu)
             resolved_refs = resolved_refs[:8]
 
-        composed_prompt = _compose_prompt(prompt, style_preset)
+        # Optional reference analysis — vision-to-JSON on each ref, fold the
+        # extracted design rules into the prompt as explicit directives.
+        # Much higher fidelity than letting Gemini's image-gen guess what's
+        # transferable from a raw reference image.
+        ref_directives = ""
+        ref_analyses: list[dict] = []
+        ref_analysis_errors: list[str] = []
+        if analyze_references and resolved_refs and _GEMINI_API_KEY:
+            ref_analyses, ref_analysis_errors = _analyze_references_parallel(
+                resolved_refs, max_n=3,
+            )
+            ref_directives = _build_reference_directives(ref_analyses)
+
+        composed_prompt = _compose_prompt(prompt, style_preset, ref_directives)
 
         submit = create_task(
             prompt=composed_prompt,
@@ -390,6 +615,8 @@ def _build_mcp() -> FastMCP:
             "outliers": outliers_list,
             "outlier_topic": outlier_topic or (prompt if find_outliers_first else None),
             "outlier_error": outlier_error,
+            "reference_analyses": ref_analyses,
+            "reference_analysis_errors": ref_analysis_errors,
         }
         if submit.get("success"):
             payload.update({
@@ -460,6 +687,35 @@ def _build_mcp() -> FastMCP:
             payload["state"] = "pending"
             payload["upstream_state"] = state
         return json.dumps(payload, default=str)
+
+    # ----- Optional standalone vision-to-JSON tool --------------------------
+    # Useful as a building block — Claude can call it directly to break down
+    # any thumbnail without going through the generation flow. Also exposed
+    # for external callers who want the structured analysis without the
+    # generate step.
+    if _GEMINI_API_KEY:
+        @mcp.tool(
+            name="analyze_thumbnail",
+            title="Analyze Thumbnail (Vision to JSON)",
+            description=(
+                "Run Gemini vision on a thumbnail image URL and return a "
+                "structured JSON breakdown: subject, composition, color "
+                "palette, typography, lighting, style genre, emotional cue, "
+                "and what makes the design work. Useful for: understanding "
+                "why a high-CTR thumbnail performs; extracting reusable "
+                "design rules; teaching the user thumbnail design language. "
+                "Internally this is the same analysis generate_thumbnail "
+                "runs when analyze_references=true."
+            ),
+        )
+        async def analyze_thumbnail_tool(
+            image_url: Annotated[str, "Public HTTPS image URL to analyze. Accepts any image; YouTube hqdefault URLs work great."],
+        ) -> str:
+            import json
+            analysis, error = _analyze_image_via_gemini(image_url)
+            if analysis is None:
+                return json.dumps({"success": False, "error": error or "unknown error"})
+            return json.dumps({"success": True, "image_url": image_url, "analysis": analysis}, default=str)
 
     # ----- Optional algrow-powered outlier picker --------------------------
     # Only registered when ALGROW_API_KEY is configured. Lets the widget (and
