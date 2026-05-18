@@ -434,6 +434,8 @@ function startPolling(taskId, app, opts) {
           resolution: opts.resolution || "2K",
           reference_urls: opts.reference_urls || [],
           style_preset: opts.style_preset || "person_focal",
+          outliers: opts.outliers || [],
+          outlier_topic: opts.outlier_topic || null,
         },
       });
       const text = res?.content?.[0]?.text ?? "";
@@ -487,6 +489,25 @@ function render(payload, app, opts = {}) {
   if (payload.resolution) resolutionEl.value = payload.resolution;
   if (payload.style_preset && stylePresetEl) stylePresetEl.value = payload.style_preset;
 
+  // Outliers can ride along with ANY payload (pending / success / fail) when
+  // generate_thumbnail was called with find_outliers_first=true. Render them
+  // alongside the preview / result so the user keeps the picker in the same
+  // widget instance and can swap references without re-prompting.
+  if (Array.isArray(payload.outliers) && payload.outliers.length) {
+    renderOutliers({
+      topic: payload.outlier_topic || payload.prompt,
+      outliers: payload.outliers,
+      content_type: payload.content_type,
+      error: payload.outlier_error,
+    });
+  } else if (payload.outlier_error) {
+    renderOutliers({
+      topic: payload.outlier_topic || payload.prompt,
+      outliers: [],
+      error: payload.outlier_error,
+    });
+  }
+
   // If the server told us about references it resolved, mirror them into
   // the textarea + thumbnails so the user sees what's being passed to Kie
   // (covers the case where the host pipes a tool result in via ontoolresult
@@ -513,6 +534,8 @@ function render(payload, app, opts = {}) {
         resolution: payload.resolution,
         reference_urls: payload.reference_urls,
         style_preset: payload.style_preset,
+        outliers: payload.outliers,
+        outlier_topic: payload.outlier_topic,
       });
     }
     return;

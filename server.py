@@ -73,6 +73,60 @@ _FRIENDLY_ERROR_PATTERNS = (
 )
 
 
+def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
+                                 limit: int = 12, min_outlier_score: float = 2.0
+                                 ) -> tuple[list[dict], str | None]:
+    """Server-internal call to algrow's viral-videos search.
+
+    Returns (outliers, error). On error, outliers is [] and error has the
+    user-facing message. Same params + same shape as find_outlier_references
+    so the two paths produce identical widget state.
+    """
+    if not _ALGROW_API_KEY:
+        return [], "Algrow integration not configured (set ALGROW_API_KEY)."
+    try:
+        resp = requests.post(
+            f"{_ALGROW_API_BASE}/api/viral-videos/search",
+            headers={
+                "Authorization": f"Bearer {_ALGROW_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "q": topic,
+                "content_type": content_type if content_type in ("longform", "shorts") else "longform",
+                "sort_by": "similarity",
+                "per_page": max(1, min(int(limit), 24)),
+                "min_outlier_score": min_outlier_score,
+            },
+            timeout=90,
+        )
+        data = resp.json() if resp.content else {}
+    except requests.exceptions.Timeout:
+        return [], "Algrow timed out (>90s). Try a more specific topic."
+    except Exception as e:
+        logger.warning(f"algrow API call failed: {e}")
+        return [], _friendly_error(str(e))
+
+    if resp.status_code != 200 or not data.get("success"):
+        return [], _friendly_error(data.get("error") or f"algrow returned HTTP {resp.status_code}")
+
+    outliers = []
+    for v in (data.get("videos") or [])[:limit]:
+        outliers.append({
+            "video_id": v.get("video_id"),
+            "title": v.get("title") or "",
+            "thumbnail_url": v.get("thumbnail_url"),
+            "outlier_score": v.get("outlier_score"),
+            "channel_name": v.get("channel_name") or "",
+            "view_count": v.get("view_count"),
+            "url": v.get("url") or (
+                f"https://www.youtube.com/watch?v={v.get('video_id')}"
+                if v.get("video_id") else None
+            ),
+        })
+    return outliers, None
+
+
 # Reference URLs accepted by generate_thumbnail. The widget surface is a
 # free-text input where users paste whatever they have — YouTube watch
 # links, shorts URLs, raw video IDs, or direct image URLs. We normalize
@@ -293,12 +347,31 @@ def _build_mcp() -> FastMCP:
         reference_urls: Annotated[list[str] | None, "Up to 8 reference inputs. Each can be a YouTube URL (watch / shorts / youtu.be / embed / live), a bare 11-char video ID, an i.ytimg.com URL, or any direct image URL. YouTube URLs are auto-resolved to the video's hqdefault thumbnail server-side."] = None,
         reference_images: Annotated[list[str] | None, "Alias for `reference_urls`, accepted for back-compat. Prefer reference_urls in new code."] = None,
         style_preset: Annotated[str, "Composition preset prepended to the prompt. Pick based on whether the video has a face on camera:\n• 'person_focal' (DEFAULT) — for videos featuring a real on-camera creator. Person on the left, face large/expressive, big text right, cutout depth, cinematic lighting (Unlayered / Pitagoras / MrBeast style).\n• 'faceless' — for videos with NO on-camera person (challenge series, business case studies, explainers, ASMR/cooking close-ups, tier-list style). Dominant centered hero object/scene tells the story via metaphor or juxtaposition; large decorative text; spotlight or editorial lighting; dark bg + single accent color.\n• 'none' — pass prompt verbatim with no composition guidance. Use ONLY when the user has very specific creative direction that would conflict with a preset.\nPick faceless if the video idea doesn't naturally include a person on camera, even if the user didn't say 'faceless' explicitly."] = "person_focal",
+        find_outliers_first: Annotated[bool, "Set True to auto-fetch viral references from algrow and use the top 3 as reference_urls, in the SAME call. This produces ONE widget with the result AND the outlier grid (user can pick alternates without re-prompting). Prefer this over calling find_outlier_references separately when the user wants 'a thumbnail with viral references for X' — separate calls mount two widgets and the user can't pick from the grid after the result lands. Best used with `outlier_topic` to keep the algrow search query short (algrow's semantic search is loose on long phrases)."] = False,
+        outlier_topic: Annotated[str | None, "Topic to search algrow for when find_outliers_first=True. Defaults to `prompt` if unset, but keeping this short (2-3 words: 'Vietnam rail', 'Amazon Prime', 'Minecraft 100 days') gives much better outlier matches than a full prompt."] = None,
     ) -> str:
         import json
 
         # Merge & normalize whatever the caller provided.
         combined = list(reference_urls or []) + list(reference_images or [])
         resolved_refs = _resolve_reference_urls(combined)
+
+        # Optional one-call outlier discovery — fetch from algrow, take top
+        # 3, fold them into reference_urls so the rest of the flow doesn't
+        # care where the refs came from. Keep the full list around for the
+        # widget to render.
+        outliers_list: list[dict] = []
+        outlier_error: str | None = None
+        if find_outliers_first and _ALGROW_API_KEY:
+            outliers_list, outlier_error = _fetch_outliers_from_algrow(
+                topic=(outlier_topic or prompt).strip(),
+            )
+            for o in outliers_list[:3]:
+                tu = o.get("thumbnail_url")
+                if tu and tu not in resolved_refs:
+                    resolved_refs.append(tu)
+            resolved_refs = resolved_refs[:8]
+
         composed_prompt = _compose_prompt(prompt, style_preset)
 
         submit = create_task(
@@ -314,6 +387,9 @@ def _build_mcp() -> FastMCP:
             "resolution": resolution,
             "reference_urls": resolved_refs,
             "style_preset": style_preset,
+            "outliers": outliers_list,
+            "outlier_topic": outlier_topic or (prompt if find_outliers_first else None),
+            "outlier_error": outlier_error,
         }
         if submit.get("success"):
             payload.update({
@@ -346,6 +422,8 @@ def _build_mcp() -> FastMCP:
         resolution: Annotated[str, "Echoed back to the widget."] = "2K",
         reference_urls: Annotated[list[str] | None, "Echoed back to the widget so the reference thumbnails stay visible during polling."] = None,
         style_preset: Annotated[str, "Echoed back to the widget so the preset dropdown stays in sync across polls (otherwise the second poll wipes the value Claude originally chose)."] = "person_focal",
+        outliers: Annotated[list[dict] | None, "Echoed back to the widget so the outlier grid persists across polling rounds. Widget sends this when the original generate_thumbnail call had find_outliers_first=True."] = None,
+        outlier_topic: Annotated[str | None, "Echoed back; lets the widget keep the outlier-section header label."] = None,
     ) -> str:
         import json
 
@@ -357,6 +435,8 @@ def _build_mcp() -> FastMCP:
             "task_id": task_id,
             "reference_urls": reference_urls or [],
             "style_preset": style_preset,
+            "outliers": outliers or [],
+            "outlier_topic": outlier_topic,
         }
         if not status.get("success"):
             # Transient query error — keep widget in pending so it retries
@@ -418,90 +498,27 @@ def _build_mcp() -> FastMCP:
             limit: Annotated[int, "Max thumbnails to return. Default 12, capped at 24."] = 12,
             min_outlier_score: Annotated[float, "Floor on outlier multiplier — only include videos that outperformed their channel average by at least this factor. Default 2.0 (validated against hand-eval: lower lets in too much noise, higher misses too many strong references)."] = 2.0,
         ) -> str:
+            """Use this ONLY when the user wants to BROWSE outliers manually
+            before generating (e.g. "show me outliers on X"). If they want
+            to generate a thumbnail with outlier references in one go, call
+            generate_thumbnail with find_outliers_first=True instead —
+            otherwise two separate widgets mount and the user can't pick
+            from the grid after the result lands.
+            """
             import json
 
-            limit = max(1, min(int(limit or 12), 24))
-            if content_type not in ("longform", "shorts"):
-                content_type = "longform"
-
-            try:
-                # 90s timeout — algrow's similarity sort runs an embedding
-                # lookup + vector search that takes 25–60s in practice
-                # (measured 2026-05-17). claude.ai's MCP host caps tool
-                # calls at ~2 min, so 90s gives algrow headroom while
-                # leaving slack for our own overhead.
-                #
-                # sort_by=similarity is intentional, not outlier_score:
-                # the user wants topically-relevant references first
-                # (otherwise pure outlier sort surfaces "Hidden Villages
-                # of the Amazon" for an "Amazon Prime" query — high
-                # outlier, wrong topic). Then min_outlier_score=2.0
-                # culls weak performers. Validated by hand-eval as the
-                # best signal/noise balance.
-                resp = requests.post(
-                    f"{_ALGROW_API_BASE}/api/viral-videos/search",
-                    headers={
-                        "Authorization": f"Bearer {_ALGROW_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "q": topic,
-                        "content_type": content_type,
-                        "sort_by": "similarity",
-                        "per_page": limit,
-                        "min_outlier_score": min_outlier_score,
-                    },
-                    timeout=90,
-                )
-                data = resp.json() if resp.content else {}
-            except requests.exceptions.Timeout:
-                return json.dumps({
-                    "view": "outlier_picker",
-                    "topic": topic,
-                    "outliers": [],
-                    "error": "Algrow's outlier search timed out (>90s). Try a more specific topic or try again — their semantic search can be cold on first hit.",
-                })
-            except Exception as e:
-                logger.warning(f"algrow API call failed: {e}")
-                return json.dumps({
-                    "view": "outlier_picker",
-                    "topic": topic,
-                    "outliers": [],
-                    "error": _friendly_error(str(e)),
-                })
-
-            if resp.status_code != 200 or not data.get("success"):
-                err = data.get("error") or f"algrow returned HTTP {resp.status_code}"
-                return json.dumps({
-                    "view": "outlier_picker",
-                    "topic": topic,
-                    "outliers": [],
-                    "error": _friendly_error(err),
-                })
-
-            # Slim each video down to what the widget actually renders. The
-            # grid uses thumbnail_url + outlier_score + title; url is for
-            # the "open on YouTube" click-through.
-            outliers = []
-            for v in (data.get("videos") or [])[:limit]:
-                outliers.append({
-                    "video_id": v.get("video_id"),
-                    "title": v.get("title") or "",
-                    "thumbnail_url": v.get("thumbnail_url"),
-                    "outlier_score": v.get("outlier_score"),
-                    "channel_name": v.get("channel_name") or "",
-                    "view_count": v.get("view_count"),
-                    "url": v.get("url") or (
-                        f"https://www.youtube.com/watch?v={v.get('video_id')}"
-                        if v.get("video_id") else None
-                    ),
-                })
-
+            outliers, error = _fetch_outliers_from_algrow(
+                topic=topic,
+                content_type=content_type,
+                limit=limit,
+                min_outlier_score=min_outlier_score,
+            )
             return json.dumps({
                 "view": "outlier_picker",
                 "topic": topic,
                 "content_type": content_type,
                 "outliers": outliers,
+                "error": error,
             }, default=str)
 
     return mcp
