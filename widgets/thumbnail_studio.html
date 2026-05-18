@@ -233,6 +233,10 @@
       <option value="1K">1K</option>
       <option value="4K">4K</option>
     </select>
+    <select id="style-preset" title="Composition preset — person_focal applies pro YouTube composition rules">
+      <option value="person_focal" selected>Person-focal</option>
+      <option value="none">No preset</option>
+    </select>
     <span style="flex:1;"></span>
     <button class="primary" id="generate">Generate</button>
   </div>
@@ -249,6 +253,7 @@ const meta = document.getElementById("meta");
 const promptEl = document.getElementById("prompt");
 const aspectEl = document.getElementById("aspect");
 const resolutionEl = document.getElementById("resolution");
+const stylePresetEl = document.getElementById("style-preset");
 const generateBtn = document.getElementById("generate");
 const refToggle = document.getElementById("ref-toggle");
 const refBox = document.getElementById("ref-box");
@@ -478,6 +483,7 @@ function render(payload, app, opts = {}) {
   if (payload.prompt && !promptEl.value) promptEl.value = payload.prompt;
   if (payload.aspect_ratio) aspectEl.value = payload.aspect_ratio;
   if (payload.resolution) resolutionEl.value = payload.resolution;
+  if (payload.style_preset && stylePresetEl) stylePresetEl.value = payload.style_preset;
 
   // If the server told us about references it resolved, mirror them into
   // the textarea + thumbnails so the user sees what's being passed to Kie
@@ -639,6 +645,7 @@ function applyHostContext(ctx) {
         prompt,
         aspect_ratio: aspectEl.value,
         resolution: resolutionEl.value,
+        style_preset: stylePresetEl?.value || "person_focal",
       };
       const refs = parseRefUrls();
       if (refs.length) args.reference_urls = refs;

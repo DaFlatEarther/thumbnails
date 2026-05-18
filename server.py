@@ -135,6 +135,54 @@ def _resolve_reference_urls(urls: list[str] | None) -> list[str]:
     return out
 
 
+# Composition presets — prepended to the user's prompt before submit so the
+# output follows YouTube-thumbnail design conventions even when the prompt
+# itself is bare (e.g. "make me a thumbnail about Amazon Prime downfall").
+# Tuned from hand-eval against high-CTR Unlayered / Pitagoras / MrBeast-style
+# thumbnails. Faceless preset will be added once we hand-eval that family.
+_PERSON_FOCAL_STYLE = (
+    "COMPOSITION (apply strictly — this is a YouTube thumbnail for a video "
+    "featuring a real on-camera creator):\n"
+    "• Subject: ONE main person on the LEFT 30–40% of the frame. Face is "
+    "  large, well-lit, expressive — close-up to medium shot, eye contact "
+    "  with viewer or a strong emotional cue (joy, shock, intensity, fear). "
+    "  Never a neutral expression. Use a cutout/photoshop-cut feel with a "
+    "  subtle drop shadow so the person reads as layered over the scene.\n"
+    "• Background: supports the topic — relevant setting, object, or scene "
+    "  — fills the RIGHT 60–70% of the frame. Clearly contrasted from the "
+    "  subject (different colors / depth / lighting).\n"
+    "• Text overlay: bold heavy sans-serif, MAX 2–3 short words, very high "
+    "  contrast (white with hard shadow or stroke, or saturated yellow on "
+    "  dark). Positioned to NOT cover the face. Often paired with a chunky "
+    "  arrow pointing at the secondary subject.\n"
+    "• Props: small in-frame object (phone, gadget, food, weapon) held by "
+    "  the subject reinforces the narrative — include one when natural.\n"
+    "• Lighting: cinematic, dramatic, clear subject-background separation. "
+    "  Rim light on the subject is great.\n"
+    "• Color: high saturation, one dominant accent color tied to the topic "
+    "  (e.g. red for danger, blue for tech, green for money/nature).\n"
+    "• Format: 16:9, sharp focus, no motion blur on the face.\n"
+    "AVOID: small text, neutral expressions, busy backgrounds, low contrast, "
+    "muted/desaturated palettes, generic stock-photo poses, multiple "
+    "competing focal points, watermarks, logos."
+)
+
+_STYLE_PRESETS = {
+    "person_focal": _PERSON_FOCAL_STYLE,
+    "none": "",
+}
+
+
+def _compose_prompt(user_prompt: str, preset: str) -> str:
+    """Glue the composition preset onto the user's prompt. The user's intent
+    stays first (so it dominates), the composition rules trail as a styling
+    layer the model treats as constraints."""
+    style = _STYLE_PRESETS.get(preset or "person_focal", _PERSON_FOCAL_STYLE)
+    if not style:
+        return user_prompt
+    return f"SUBJECT / SCENE:\n{user_prompt.strip()}\n\n{style}"
+
+
 def _friendly_error(raw: str | None) -> str:
     """Rewrite a known upstream error string into something a user can act on.
     Returns the raw string unchanged if no pattern matches."""
@@ -200,20 +248,22 @@ def _build_mcp() -> FastMCP:
         meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
     )
     async def generate_thumbnail_tool(
-        prompt: Annotated[str, "Description of the thumbnail to generate. Be specific about subject, style, mood, and composition — Nano Banana Pro renders detail well."],
+        prompt: Annotated[str, "Describe the SUBJECT and SCENE — who's on camera (or what the visual is about), what's happening, key props, and any text overlay the user wants. You don't need to specify composition / layout / color rules — the server applies them via the style_preset. Focus the prompt on content; let the preset handle composition."],
         aspect_ratio: Annotated[str, "16:9 / 9:16 / 1:1 / 4:5 / 4:3 / 3:2 / 21:9 / auto. Default 16:9 (YouTube thumbnail)."] = "16:9",
         resolution: Annotated[str, "1K / 2K / 4K. Default 2K — plenty for thumbnails and ~4× faster than 4K."] = "2K",
         reference_urls: Annotated[list[str] | None, "Up to 8 reference inputs. Each can be a YouTube URL (watch / shorts / youtu.be / embed / live), a bare 11-char video ID, an i.ytimg.com URL, or any direct image URL. YouTube URLs are auto-resolved to the video's hqdefault thumbnail server-side."] = None,
         reference_images: Annotated[list[str] | None, "Alias for `reference_urls`, accepted for back-compat. Prefer reference_urls in new code."] = None,
+        style_preset: Annotated[str, "Composition preset prepended to the prompt: 'person_focal' (DEFAULT — for videos featuring a real on-camera creator: face left, big text right, cutout depth, cinematic lighting, high-contrast accent color — matches the Unlayered / Pitagoras / MrBeast school of thumbnail design) | 'none' (pass prompt verbatim, no composition guidance — use ONLY when the user has very specific creative direction that conflicts with the default rules). A 'faceless' preset is planned."] = "person_focal",
     ) -> str:
         import json
 
         # Merge & normalize whatever the caller provided.
         combined = list(reference_urls or []) + list(reference_images or [])
         resolved_refs = _resolve_reference_urls(combined)
+        composed_prompt = _compose_prompt(prompt, style_preset)
 
         submit = create_task(
-            prompt=prompt,
+            prompt=composed_prompt,
             aspect_ratio=aspect_ratio,
             resolution=resolution,
             image_input=resolved_refs or None,
@@ -224,6 +274,7 @@ def _build_mcp() -> FastMCP:
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
             "reference_urls": resolved_refs,
+            "style_preset": style_preset,
         }
         if submit.get("success"):
             payload.update({
