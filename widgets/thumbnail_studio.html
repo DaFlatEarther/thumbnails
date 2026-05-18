@@ -433,6 +433,7 @@ function startPolling(taskId, app, opts) {
           aspect_ratio: opts.aspect_ratio || "16:9",
           resolution: opts.resolution || "2K",
           reference_urls: opts.reference_urls || [],
+          style_preset: opts.style_preset || "person_focal",
         },
       });
       const text = res?.content?.[0]?.text ?? "";
@@ -511,6 +512,7 @@ function render(payload, app, opts = {}) {
         aspect_ratio: payload.aspect_ratio,
         resolution: payload.resolution,
         reference_urls: payload.reference_urls,
+        style_preset: payload.style_preset,
       });
     }
     return;

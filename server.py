@@ -345,6 +345,7 @@ def _build_mcp() -> FastMCP:
         aspect_ratio: Annotated[str, "Echoed back to the widget."] = "16:9",
         resolution: Annotated[str, "Echoed back to the widget."] = "2K",
         reference_urls: Annotated[list[str] | None, "Echoed back to the widget so the reference thumbnails stay visible during polling."] = None,
+        style_preset: Annotated[str, "Echoed back to the widget so the preset dropdown stays in sync across polls (otherwise the second poll wipes the value Claude originally chose)."] = "person_focal",
     ) -> str:
         import json
 
@@ -355,6 +356,7 @@ def _build_mcp() -> FastMCP:
             "resolution": resolution,
             "task_id": task_id,
             "reference_urls": reference_urls or [],
+            "style_preset": style_preset,
         }
         if not status.get("success"):
             # Transient query error — keep widget in pending so it retries
