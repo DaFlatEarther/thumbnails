@@ -613,11 +613,18 @@ def _build_mcp() -> FastMCP:
             "reference_urls": resolved_refs,
             "style_preset": style_preset,
             "outliers": outliers_list,
-            "outlier_topic": outlier_topic or (prompt if find_outliers_first else None),
-            "outlier_error": outlier_error,
-            "reference_analyses": ref_analyses,
-            "reference_analysis_errors": ref_analysis_errors,
         }
+        # Optional fields — only include when populated, so Claude doesn't
+        # misread null keys as failure signals.
+        topic_for_outliers = outlier_topic or (prompt if find_outliers_first else None)
+        if topic_for_outliers:
+            payload["outlier_topic"] = topic_for_outliers
+        if outlier_error:
+            payload["outlier_error"] = outlier_error
+        if ref_analyses:
+            payload["reference_analyses"] = ref_analyses
+        if ref_analysis_errors:
+            payload["reference_analysis_errors"] = ref_analysis_errors
         if submit.get("success"):
             payload.update({
                 "state": "pending",
@@ -754,12 +761,15 @@ def _build_mcp() -> FastMCP:
             limit: Annotated[int, "Max thumbnails to return. Default 12, capped at 24."] = 12,
             min_outlier_score: Annotated[float, "Floor on outlier multiplier — only include videos that outperformed their channel average by at least this factor. Default 2.0 (validated against hand-eval: lower lets in too much noise, higher misses too many strong references)."] = 2.0,
         ) -> str:
-            """Use this ONLY when the user wants to BROWSE outliers manually
-            before generating (e.g. "show me outliers on X"). If they want
-            to generate a thumbnail with outlier references in one go, call
-            generate_thumbnail with find_outliers_first=True instead —
-            otherwise two separate widgets mount and the user can't pick
-            from the grid after the result lands.
+            """STRONGLY PREFER generate_thumbnail(find_outliers_first=True)
+            over this tool. This tool exists ONLY for the rare 'user wants
+            to BROWSE outliers in isolation, no generation yet' case (e.g.
+            'show me what's working in the AI niche right now'). For
+            anything that ends in 'generate a thumbnail', call
+            generate_thumbnail directly with find_outliers_first=True —
+            otherwise the chat mounts two separate widgets, the outlier
+            picker becomes useless the moment the result lands, and the
+            user can't swap reference picks without re-prompting.
             """
             import json
 
@@ -769,13 +779,20 @@ def _build_mcp() -> FastMCP:
                 limit=limit,
                 min_outlier_score=min_outlier_score,
             )
-            return json.dumps({
+            # Only include the error key on actual error — Claude tends to
+            # read the *presence* of an "error" field as a failure signal
+            # even when the value is null. Empty outliers + no error key
+            # means "algrow had nothing for this topic", not a tool fault.
+            payload = {
                 "view": "outlier_picker",
                 "topic": topic,
                 "content_type": content_type,
                 "outliers": outliers,
-                "error": error,
-            }, default=str)
+                "count": len(outliers),
+            }
+            if error:
+                payload["error"] = error
+            return json.dumps(payload, default=str)
 
     return mcp
 
