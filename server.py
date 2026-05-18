@@ -167,8 +167,47 @@ _PERSON_FOCAL_STYLE = (
     "competing focal points, watermarks, logos."
 )
 
+_FACELESS_STYLE = (
+    "COMPOSITION (apply strictly — this is a YouTube thumbnail for a "
+    "FACELESS video, no on-camera creator):\n"
+    "• Subject: ONE dominant hero object, scene, or prop, usually CENTERED "
+    "  (not off to the side). The object IS the story — choose something "
+    "  symbolically loaded or visually striking (e.g. skeleton hands holding "
+    "  a ring box for a 'cost of love' video; a single highlighted product "
+    "  on a pile of competitors; a transformation/before-after visual).\n"
+    "• Narrative via metaphor or juxtaposition — pair the hero with a "
+    "  supporting visual that creates the curiosity gap (e.g. one bright "
+    "  object atop a pile of defeated rivals; a small creature swarmed by "
+    "  many; a clean futuristic product against a contrasting map / route / "
+    "  context). With no face to carry emotion, the SETUP carries it.\n"
+    "• Text overlay: LARGER and more designed than in person-focal — bold "
+    "  heavy sans-serif OR decorative gothic / condensed display font. Can "
+    "  flank or frame the hero (e.g. 'LUCKIN [cup] COFFEE', 'the price [box] "
+    "  you pay'), or use numbers / strikethroughs as the visual device "
+    "  ('30 HOURS' crossed out → '6 HOURS'). High contrast — white with "
+    "  hard shadow, glowing edges, or single bright color against dark.\n"
+    "• Lighting: spotlight / movie-poster / product-shot feel. Often a "
+    "  single dramatic light beam on the hero from above, dark surrounding "
+    "  void. OR clean editorial / explainer lighting for data-driven topics.\n"
+    "• Color: disciplined palette — dark / black background + ONE saturated "
+    "  accent color (deep red, neon blue, hot pink, glowing white). For "
+    "  editorial-style thumbnails, use a clean limited palette (1 hero "
+    "  color + 1 neutral + 1 contrast). Avoid muddy mid-tones.\n"
+    "• Composition: tight, often symmetric. No wasted space. Every element "
+    "  earns its place. Split layouts work when one side is the physical "
+    "  hero and the other is UI / map / data overlay.\n"
+    "• Texture / grain: subtle film grain or noise on dark backgrounds adds "
+    "  premium feel — never on the bright hero subject itself.\n"
+    "• Format: 16:9, sharp focus on the hero subject.\n"
+    "AVOID: people / faces (this preset is explicitly faceless), low-contrast "
+    "or muted palettes, small text, multiple competing focal points, generic "
+    "stock backgrounds, off-center subjects unless paired with a deliberate "
+    "left/right split."
+)
+
 _STYLE_PRESETS = {
     "person_focal": _PERSON_FOCAL_STYLE,
+    "faceless": _FACELESS_STYLE,
     "none": "",
 }
 
@@ -253,7 +292,7 @@ def _build_mcp() -> FastMCP:
         resolution: Annotated[str, "1K / 2K / 4K. Default 2K — plenty for thumbnails and ~4× faster than 4K."] = "2K",
         reference_urls: Annotated[list[str] | None, "Up to 8 reference inputs. Each can be a YouTube URL (watch / shorts / youtu.be / embed / live), a bare 11-char video ID, an i.ytimg.com URL, or any direct image URL. YouTube URLs are auto-resolved to the video's hqdefault thumbnail server-side."] = None,
         reference_images: Annotated[list[str] | None, "Alias for `reference_urls`, accepted for back-compat. Prefer reference_urls in new code."] = None,
-        style_preset: Annotated[str, "Composition preset prepended to the prompt: 'person_focal' (DEFAULT — for videos featuring a real on-camera creator: face left, big text right, cutout depth, cinematic lighting, high-contrast accent color — matches the Unlayered / Pitagoras / MrBeast school of thumbnail design) | 'none' (pass prompt verbatim, no composition guidance — use ONLY when the user has very specific creative direction that conflicts with the default rules). A 'faceless' preset is planned."] = "person_focal",
+        style_preset: Annotated[str, "Composition preset prepended to the prompt. Pick based on whether the video has a face on camera:\n• 'person_focal' (DEFAULT) — for videos featuring a real on-camera creator. Person on the left, face large/expressive, big text right, cutout depth, cinematic lighting (Unlayered / Pitagoras / MrBeast style).\n• 'faceless' — for videos with NO on-camera person (challenge series, business case studies, explainers, ASMR/cooking close-ups, tier-list style). Dominant centered hero object/scene tells the story via metaphor or juxtaposition; large decorative text; spotlight or editorial lighting; dark bg + single accent color.\n• 'none' — pass prompt verbatim with no composition guidance. Use ONLY when the user has very specific creative direction that would conflict with a preset.\nPick faceless if the video idea doesn't naturally include a person on camera, even if the user didn't say 'faceless' explicitly."] = "person_focal",
     ) -> str:
         import json
 
