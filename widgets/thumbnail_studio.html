@@ -1235,6 +1235,13 @@ function render(payload, app, opts = {}) {
       outliersBtn.style.display = payload.single_reference ? "none" : "";
     }
 
+    // Preselect the image-gen model from the payload (Claude can hint
+    // which backend to use via extract_reference_from_video's `model`
+    // arg — useful for biography / brand-history thumbnails where the
+    // reference itself triggers Gemini's safety filter and Seedream is
+    // a better default).
+    if (payload.model && modelEl) setDropdownValue(modelEl, payload.model);
+
     // Single-reference mode (user pasted a specific YouTube video) —
     // auto-select that card so they skip the picking step.
     if (payload.single_reference && Array.isArray(payload.outliers) && payload.outliers.length === 1) {
@@ -1432,6 +1439,7 @@ function render(payload, app, opts = {}) {
   if (payload.aspect_ratio) setDropdownValue(aspectEl, payload.aspect_ratio);
   if (payload.resolution) setDropdownValue(resolutionEl, payload.resolution);
   if (payload.style_preset && stylePresetEl) setDropdownValue(stylePresetEl, payload.style_preset);
+  if (payload.model && modelEl) setDropdownValue(modelEl, payload.model);
 
   // Outliers can ride along with ANY payload (pending / success / fail) when
   // generate_thumbnail was called with find_outliers_first=true. Render them

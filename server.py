@@ -1354,11 +1354,13 @@ def _build_mcp() -> FastMCP:
         style_preset: Annotated[str, "person_focal | faceless | none. Default 'none'."] = "none",
         aspect_ratio: Annotated[str, "16:9 / 9:16 / etc. Default 16:9."] = "16:9",
         resolution: Annotated[str, "1K / 2K / 4K. Default 2K."] = "2K",
+        model: Annotated[str, "nano-banana-pro | seedream-4.5-edit | seedream-5.0-lite. See canonical tool for behavior."] = "nano-banana-pro",
     ) -> str:
         # Forward directly to the canonical tool's behavior.
         return await extract_reference_from_video_tool(
             url_or_id=reference_video_url,
             user_title=user_title,
+            model=model,
         )
 
     # ----- Reference by direct YouTube URL --------------------------------
@@ -1389,6 +1391,7 @@ def _build_mcp() -> FastMCP:
     async def extract_reference_from_video_tool(
         url_or_id: Annotated[str, "YouTube URL (watch / shorts / youtu.be / embed / live) or bare 11-character video ID."],
         user_title: Annotated[str | None, "The user's NEW video title — what THEIR thumbnail is for (different from the reference video's own title). Widget pre-fills its title field with this. Always pass when you have it."] = None,
+        model: Annotated[str, "Image-gen backend the widget should preselect:\n• 'nano-banana-pro' (DEFAULT) — Gemini 3 Pro Image direct. Highest quality, but its safety filter blocks named real people / brands / references containing public figures (BlockedReason.OTHER).\n• 'seedream-4.5-edit' — Algrow proxy, image-to-image. Different (more permissive) filter — pick this when the reference video is ABOUT a real person (biography channels, founder stories, etc.) because Gemini will block on the reference image content alone.\n• 'seedream-5.0-lite' — Algrow proxy, text-to-image with optional reference. Also more permissive than Gemini direct.\nDefault to seedream-4.5-edit when the user's title is a biography / brand-history / public-figure piece, otherwise nano-banana-pro."] = "nano-banana-pro",
     ) -> str:
         import json
         # Fresh task invocation — clear any saved WIP for this title so the
@@ -1427,6 +1430,7 @@ def _build_mcp() -> FastMCP:
             "count": 1,
             "content_type": "longform",
             "single_reference": True,
+            "model": model,
         }
         if user_title:
             payload["title"] = user_title
