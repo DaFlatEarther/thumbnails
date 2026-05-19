@@ -423,31 +423,41 @@ RULE 4 — STRUCTURAL ELEMENTS THE REFERENCE USES MUST BE PRESERVED:
   • Visual devices — arrows, circles, strikethroughs, price tags, badges. If the reference has a red curved arrow, the output has a red curved arrow. If the reference has a price tag in the corner, the output has a price tag in the corner. Adapt the CONTENT of the device (e.g. price value swaps to fit the new title's tone), not its presence.
   • Background type and lighting style — same kind of background (e.g. luxury boutique blurred → keep as a relevant blurred high-end backdrop), same lighting style (warm boutique = warm boutique, dark dramatic = dark dramatic).
 
-RULE 5 — SUBJECT SPECIFICITY MUST MATCH THE TITLE. NAME REAL PEOPLE AND BRANDS WHEN APPROPRIATE.
-The level of specificity in your output prompt must match what the user's title implies:
+RULE 5 — NEVER NAME REAL PEOPLE OR REAL BRANDS. DESCRIBE THEM PHYSICALLY INSTEAD.
+The downstream image model's safety filter blocks generations that name real public figures or brand names (it returns BlockedReason.OTHER and the user gets nothing). To produce reliable renders, you must NEVER write the name of a real person or a real brand in the output prompt — even when the user's title is explicitly about that person or brand.
 
-  • If the user's title names CATEGORIES of recognizable entities ("celebrities", "wealthy CEOs", "famous athletes", "luxury watches", "supercars", "world leaders") then the output must feature SPECIFIC, RECOGNIZABLE instances of that category — not generic stand-ins. NEVER write "a celebrity-looking person", "a person who could be a celebrity", or "a famous-looking face" — those phrases tell the image model nothing useful.
+  • PEOPLE: Do not write names like "Ray Kroc", "Tom Cruise", "Beyoncé", "Elon Musk", "Pope Francis", "Yutaka Urakami". Instead, describe the person via concrete physical attributes the image generator can render: approximate age, ethnicity / nationality cues, build, hair color and style, complexion, facial features, signature clothing or accessories, characteristic expression or pose.
+    Example replacements:
+      ✗ "Ray Kroc standing in a McDonald's kitchen"
+      ✓ "an older white American man in his 60s, short slicked-back gray hair, wearing a dark business suit with a thin tie, standing in a vintage 1960s diner kitchen"
+      ✗ "Tom Cruise with an expression of wide-eyed shock"
+      ✓ "a 60-something American man with dark slicked-back hair, athletic build, a sharp jawline, wide-eyed shock expression"
 
-  • NAMING REAL PEOPLE IS ALLOWED AND ENCOURAGED for adult public figures. The downstream image generator can render recognizable adult celebrities, athletes, business figures, etc. If you can identify a specific public figure in the reference image (or one would clearly fit the user's title), name them directly in the prompt. For example: "Tom Cruise standing on the left of the frame with an expression of wide-eyed shock, facing his identical clone on the right" is FAR better than "a Hollywood actor with dark hair...". Concrete names ground the model. Use the reference image to identify who's there — Gemini Vision can recognize public figures. (If a specific name happens to get refused by the image model's content filter, the render gracefully falls back to a similar archetype — naming is still worth attempting first.)
+  • BRANDS: Do not write brand names like "McDonald's", "Rolex", "Tesla", "Apple", "Nike", "Ryobi", "Hilti". Describe what the brand LOOKS LIKE — distinctive colors, logo shape (without naming the brand), product silhouette, signature design language.
+    Example replacements:
+      ✗ "a McDonald's restaurant interior with the golden arches"
+      ✓ "a vintage 1960s American fast-food restaurant interior with warm red-and-yellow signage, formica counters, and curved booth seating"
+      ✗ "a Rolex Submariner watch on a wrist"
+      ✓ "a luxury dive-style wristwatch with a black bezel, oyster-link steel bracelet, and a black sunburst dial"
+      ✗ "a lime-green Ryobi power drill"
+      ✓ "a modern cordless power drill with a vivid lime-green body and matte-black grip"
 
-  • If you genuinely can't or shouldn't name a specific person (e.g. unclear identity in the reference, or the user wants a generic archetype), fall back to detailed physical description: build, age range, hair color and style, complexion, distinguishing facial features, signature clothing/style — concrete enough that the model has something to render.
+  • If the user's title CONTAINS a real name or brand, that's fine in the TEXT OVERLAY portion of the prompt (the visible thumbnail text is allowed to say what the title says) — but the SCENE DESCRIPTION must still use physical / visual descriptors, not names. The text overlay is rendered as letterforms, not interpreted as a directive.
 
-  • Same rule for non-person subjects. If the user's title is about a category of branded products ("Rolex Submariner", "Tesla Cybertruck", "Apple Watch Ultra"), use the BRAND/MODEL NAMES directly in the prompt. The image gen knows what these look like.
+  • The level of specificity should still match the title. If the title implies a specific category, describe a specific-LOOKING instance of that category in detail. NEVER write vague placeholders like "a celebrity-looking person" or "a famous-looking face" — those tell the image model nothing.
 
-  • The "swap the subject content" rule from Step 2 applies to GENERIC vs THE-REFERENCE-IS-DIFFERENT cases — if the user's subject is a different kind of thing from the reference's subject, swap. If the subject KIND is the same and the title is about that kind, keep the same level of specificity (named people, named products).
+RULE 6 — SWAP THE VISUAL IDENTITY WHEN THE REFERENCE'S SUBJECT IS BOUND TO ITS OWN TITLE.
+This is the most common failure mode. If the reference image shows a person, object, or product whose identity is tied to the REFERENCE'S OWN TITLE (the founder of the reference's company, the product of the reference's brand, the politician of the reference's country, the celebrity of the reference's video), AND the user's NEW TITLE is about a DIFFERENT subject, you MUST replace the visual identity at that structural role — DESCRIBED PHYSICALLY, not named.
 
-RULE 6 — SWAP THE IDENTITY WHEN THE REFERENCE'S SUBJECT IS BOUND TO ITS OWN TITLE.
-This is the most common failure mode. If the reference image shows a SPECIFIC identifiable person, object, brand, or product whose identity is tied to the REFERENCE'S OWN TITLE (the founder of the reference's company, the product of the reference's brand, the politician of the reference's country, the celebrity of the reference's video), AND the user's NEW TITLE is about a DIFFERENT specific entity, you MUST replace the identity with the appropriate equivalent for the user's title — DO NOT reuse the reference's specific subject.
+Examples (notice the swaps describe attributes, never names):
+  • Reference: a thumbnail for a story about a tool-company founder, showing a specific elderly European man + a red-and-black power tool + the company logo. User's title is about a different tool company. → Output describes an elderly Japanese man in his 70s (or whatever nationality fits the user's brand), a lime-green-and-black cordless power drill (or appropriate brand-look-alike), and a corresponding stylized logo block in a different color palette. Identity attributes swap; the structural roles (founder portrait + product + logo + warm beige bg + soft lighting + painterly aesthetic) transfer.
+  • Reference: a thumbnail for a pop-star video showing a specific identifiable woman centered. User's title is about a different pop star. → Output describes a young woman with [hair color + style + complexion + signature outfit cues distinct from the reference's person], same composition.
+  • Reference: a Pope thumbnail showing the current Pope. User's title is about a Renaissance-era Pope. → Output describes an older European man in a tall white papal mitre and gold-trimmed robes against a candlelit stone-cathedral backdrop, painted in a Renaissance-portrait style.
+  • Reference: a luxury-watch tier list showing a specific iconic dive watch. User's title is about a different watchmaker. → Output describes the visual hallmarks of that watchmaker's lineup (case shape, dial layout, bracelet style, distinguishing complications) without naming the brand.
 
-Examples:
-  • Reference shows "The Story of Hilti" with the Hilti founder + a Hilti tool + the Hilti logo. User's title is "The Story of Ryobi". → Output describes the Ryobi founder (Yutaka Urakami, elderly Japanese man), a recognizable Ryobi power tool (lime green and black impact driver / drill), and the Ryobi logo. The face, the tool, and the brand all swap. Do NOT keep the Hilti founder's face.
-  • Reference shows "How Beyoncé Stole the Spotlight" with Beyoncé centered. User's title is about Taylor Swift. → Output describes Taylor Swift, not Beyoncé.
-  • Reference shows "The Last Pope's Final Days" with Pope Francis. User's title is about a 1500s pope. → Output describes a Renaissance-era pope (named where possible), not Pope Francis.
-  • Reference shows a Rolex Submariner in a "watch tier list". User's title is "Patek Philippe tier list". → Output describes Patek Philippe watches (Nautilus, Calatrava, etc.), not the Submariner.
+The STRUCTURAL ROLE transfers (founder portrait + product + logo + warm beige bg + warm soft lighting + painterly aesthetic). The VISUAL IDENTITY at the structural role's location swaps to fit the user's title — described physically.
 
-The STRUCTURAL ROLE transfers (founder portrait + product + logo + warm beige bg + warm soft lighting + painterly aesthetic). The IDENTITY at the structural role's location swaps to fit the user's title.
-
-When you describe the swapped identity, BE EXPLICIT in concrete prose: "[user's brand]'s founder, an elderly [appropriate nationality/ethnicity] man in his 70s with [specific identifying features distinct from the reference's person]" — that way the image generator gets a counter-signal strong enough to overcome the reference's visual bleed. Vague phrases like "an older man" will let the reference image's identity bleed through; specific physical descriptors push the generator away from copying.
+When you describe the swapped identity, BE EXPLICIT in concrete prose. Vague phrases like "an older man" let the reference image's identity bleed through; specific physical descriptors push the generator away from copying. The descriptors should be specific enough that swapping to a named person would only add one word — but you don't add that word.
 
 ═══════════════════════════════════════════════════════════════════════════
 
