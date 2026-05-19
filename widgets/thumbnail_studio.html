@@ -655,7 +655,7 @@
     <button class="primary" id="generate">Generate</button>
   </div>
 
-  <div class="hint">Nano Banana Pro · 3 credits per generation · usually 30–90s</div>
+  <div class="hint" id="model-hint">Nano Banana Pro · 3 credits per generation · usually 30–90s</div>
 </div>
 
 <script type="module">
@@ -669,6 +669,40 @@ const aspectEl = document.getElementById("aspect");
 const resolutionEl = document.getElementById("resolution");
 const stylePresetEl = document.getElementById("style-preset");
 const modelEl = document.getElementById("model");
+const modelHintEl = document.getElementById("model-hint");
+
+// Per-model metadata used to keep the hint line in sync with the Model
+// dropdown. Credits are algrow's pricing; for nano-banana-pro the cost
+// is the same whether routed via algrow or direct Gemini, so the figure
+// is accurate for both paths. Time ranges are observed wall-clock from
+// submit → image-ready.
+const MODEL_META = {
+  "nano-banana-pro": {
+    label: "Nano Banana Pro",
+    credits: 3,
+    time: "30–90s",
+    behavior: "regenerates from prompt + reference as style hint",
+  },
+  "seedream-5.0-lite": {
+    label: "Seedream 5.0 Lite",
+    credits: 2,
+    time: "20–40s",
+    behavior: "regenerates · more permissive safety filter",
+  },
+  "seedream-4.5-edit": {
+    label: "Seedream 4.5 Edit",
+    credits: 2,
+    time: "20–60s",
+    behavior: "EDITS the reference · preserves subject, layout, pose",
+  },
+};
+
+function refreshModelHint() {
+  if (!modelHintEl) return;
+  const m = MODEL_META[modelEl?.value] || MODEL_META["nano-banana-pro"];
+  modelHintEl.textContent =
+    `${m.label} · ${m.credits} credits per generation · usually ${m.time} · ${m.behavior}`;
+}
 const generateBtn = document.getElementById("generate");
 const refToggle = document.getElementById("ref-toggle");
 const refBox = document.getElementById("ref-box");
@@ -1241,7 +1275,7 @@ function render(payload, app, opts = {}) {
     // arg — useful for biography / brand-history thumbnails where the
     // reference itself triggers Gemini's safety filter and Seedream is
     // a better default).
-    if (payload.model && modelEl) setDropdownValue(modelEl, payload.model);
+    if (payload.model && modelEl) { setDropdownValue(modelEl, payload.model); refreshModelHint(); }
 
     // Single-reference mode (user pasted a specific YouTube video) —
     // auto-select that card so they skip the picking step.
@@ -1367,6 +1401,7 @@ function render(payload, app, opts = {}) {
         if (payload.aspect_ratio) bits.push(payload.aspect_ratio);
         if (payload.resolution) bits.push(payload.resolution);
         if (payload.cost_time_s != null) bits.push(`${Number(payload.cost_time_s).toFixed(1)}s`);
+        if (payload.model && MODEL_META[payload.model]) bits.push(MODEL_META[payload.model].label);
         bits.push(`<a href="${escape(url)}" data-open>Open full size</a>`);
         meta.innerHTML = bits.join(" · ");
         meta.style.display = "flex";
@@ -1420,7 +1455,7 @@ function render(payload, app, opts = {}) {
         });
       }
       if (saved.stylePreset && stylePresetEl) setDropdownValue(stylePresetEl, saved.stylePreset);
-      if (saved.model && modelEl) setDropdownValue(modelEl, saved.model);
+      if (saved.model && modelEl) { setDropdownValue(modelEl, saved.model); refreshModelHint(); }
       if (saved.aspectRatio && aspectEl) setDropdownValue(aspectEl, saved.aspectRatio);
       if (saved.resolution && resolutionEl) setDropdownValue(resolutionEl, saved.resolution);
       if (saved.priorImageForReference) priorImageForReference = saved.priorImageForReference;
@@ -1440,7 +1475,7 @@ function render(payload, app, opts = {}) {
   if (payload.aspect_ratio) setDropdownValue(aspectEl, payload.aspect_ratio);
   if (payload.resolution) setDropdownValue(resolutionEl, payload.resolution);
   if (payload.style_preset && stylePresetEl) setDropdownValue(stylePresetEl, payload.style_preset);
-  if (payload.model && modelEl) setDropdownValue(modelEl, payload.model);
+  if (payload.model && modelEl) { setDropdownValue(modelEl, payload.model); refreshModelHint(); }
 
   // Outliers can ride along with ANY payload (pending / success / fail) when
   // generate_thumbnail was called with find_outliers_first=true. Render them
@@ -1717,7 +1752,8 @@ function initDropdowns() {
     saveState();
   });
   stylePresetEl?.addEventListener("change", saveState);
-  modelEl?.addEventListener("change", saveState);
+  modelEl?.addEventListener("change", () => { saveState(); refreshModelHint(); });
+  refreshModelHint();  // initial sync — covers cold-mount default of nano-banana-pro
   aspectEl?.addEventListener("change", saveState);
   resolutionEl?.addEventListener("change", saveState);
 
