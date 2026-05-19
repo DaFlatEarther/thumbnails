@@ -1418,6 +1418,19 @@ def _build_mcp() -> FastMCP:
         state = bucket.get(_state_key(user_title)) or {"title": user_title}
         state["prompt"] = new_prompt
         state["promptIsComposed"] = True
+        # Multi-turn editing: BEFORE clearing the cached generation result,
+        # stash its image URL into priorImageForReference. That way the
+        # next Generate will use the previously-generated image as the
+        # reference (so Gemini edits the prior output) instead of falling
+        # back to the original picked reference. Without this, the widget
+        # mounts fresh with no in-memory lastResultPayload, the async
+        # state restore finds a cleared lastResultPayload, and the prior
+        # image is lost entirely — making the refinement a fresh
+        # generation from the source-video thumbnail.
+        prior = state.get("lastResultPayload") or {}
+        prior_images = prior.get("images") or []
+        if prior_images:
+            state["priorImageForReference"] = prior_images[0]
         # Clear the cached generation result — the user is starting a new
         # run from the refined prompt, the OLD image is no longer current.
         # Without this, the widget's async state restore would re-render
