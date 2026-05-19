@@ -292,10 +292,37 @@
     box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.5);
     animation: gen-game-pulse 1.4s ease-in-out infinite;
   }
+  /* Once the thumbnail has finished generating but the player is still
+     in the middle of their run, the dot flips green to signal "ready". */
+  .gen-game-dot.ready {
+    background: #22c55e;
+    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.55);
+    animation-name: gen-game-pulse-ready;
+  }
   @keyframes gen-game-pulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.55); opacity: 1; }
     50%      { box-shadow: 0 0 0 8px rgba(231, 76, 60, 0);   opacity: 0.75; }
   }
+  @keyframes gen-game-pulse-ready {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.55); opacity: 1; }
+    50%      { box-shadow: 0 0 0 8px rgba(34, 197, 94, 0);   opacity: 0.75; }
+  }
+  /* Reveal overlay — the generated <img> fades in on top of the game
+     canvas. Opacity transition is the only thing that animates; the
+     canvas underneath keeps running until the final DOM swap. */
+  .thumb-reveal {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    opacity: 0;
+    transition: opacity 0.7s ease;
+    z-index: 20;
+    cursor: zoom-in;
+    display: block;
+  }
+  .thumb-reveal.in { opacity: 1; }
   .gen-game-sub {
     color: #888;
     font-family: "DM Sans", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
@@ -1489,6 +1516,9 @@ class DinoGame {
           this.best = this.score;
           try { localStorage.setItem(_GAME_BEST_KEY, String(this.best)); } catch (_) {}
         }
+        if (typeof this.onGameOver === "function") {
+          try { this.onGameOver(); } catch (_) {}
+        }
         break;
       }
     }
@@ -1873,6 +1903,120 @@ class DinoGame {
 // Mount/teardown helper — watches the preview pane for innerHTML swaps so
 // the game cleans up itself when the loader is replaced by the image.
 let _activeDinoGame = null;
+
+// When the thumbnail finishes generating but the human is still mid-run,
+// we don't yank the game out from under them. The result gets parked
+// here; the game's onGameOver callback (or any subsequent render call
+// that finds the game already done) flushes it via performReveal().
+let _pendingThumbnail = null;
+
+// Returns true when the human is actively engaged in the game right now,
+// i.e. they took over from autopilot AND haven't crashed yet. Autopilot
+// runs don't count — those users are just watching the loader and want
+// to see the thumbnail the moment it lands.
+function _humanIsPlaying() {
+  return !!(_activeDinoGame
+    && _activeDinoGame.alive
+    && _activeDinoGame.started
+    && !_activeDinoGame.over
+    && !_activeDinoGame.autopilot);
+}
+
+// Park the result + update the corner overlay to "Thumbnail ready" so the
+// player knows their image landed and they only need to crash to see it.
+function _parkThumbnail(url, payload, app) {
+  _pendingThumbnail = { url, payload, app };
+  if (!preview) return;
+  const dot = preview.querySelector(".gen-game-dot");
+  if (dot) dot.classList.add("ready");
+  const status = preview.querySelector(".gen-game-status");
+  if (status) {
+    const dotNode = status.querySelector(".gen-game-dot");
+    status.textContent = "";  // wipe inner text
+    if (dotNode) status.appendChild(dotNode);
+    status.appendChild(document.createTextNode(" Thumbnail ready"));
+  }
+  const subs = preview.querySelectorAll(".gen-game-sub");
+  if (subs[0]) subs[0].textContent = "Crash to reveal it";
+  if (subs[1]) subs[1].textContent = "or keep going for a high score";
+}
+
+// Smooth opacity fade from the game canvas to the finished thumbnail.
+// If there's no game in preview (e.g. user never opened the chat while
+// generating), still does a brief fade-in for polish. After the fade
+// settles, the DOM gets simplified to just the <img>.
+function performReveal(url, payload, app) {
+  if (!preview) return;
+  _pendingThumbnail = null;
+  const game = preview.querySelector(".gen-game");
+  const container = game || preview;
+  if (!game) {
+    // Preview isn't positioned by default; make it so the absolute reveal
+    // can pin to its edges. We reset this after the swap.
+    preview.style.position = "relative";
+  }
+  const img = document.createElement("img");
+  img.className = "thumb-reveal";
+  img.src = url;
+  img.referrerPolicy = "no-referrer";
+  img.alt = "generated thumbnail";
+  img.addEventListener("click", () => { app?.openLink({ url }).catch(() => {}); });
+  container.appendChild(img);
+  // Next frame: toggle the class so the opacity transition runs.
+  requestAnimationFrame(() => img.classList.add("in"));
+  // After the fade settles, collapse to a clean DOM with just the final
+  // image. Use transitionend if available, with a setTimeout safety net
+  // for browsers that drop the event under tab-throttle.
+  let finalized = false;
+  const finalize = () => {
+    if (finalized) return;
+    finalized = true;
+    if (_activeDinoGame) {
+      try { _activeDinoGame.destroy(); } catch (_) {}
+      _activeDinoGame = null;
+    }
+    if (!preview) return;
+    preview.style.position = "";
+    preview.innerHTML = "";
+    const finalImg = document.createElement("img");
+    finalImg.src = url;
+    finalImg.referrerPolicy = "no-referrer";
+    finalImg.alt = "generated thumbnail";
+    finalImg.style.cursor = "zoom-in";
+    finalImg.addEventListener("click", () => { app?.openLink({ url }).catch(() => {}); });
+    preview.appendChild(finalImg);
+  };
+  img.addEventListener("transitionend", finalize, { once: true });
+  setTimeout(finalize, 900);
+
+  // Meta line — show stats / open-full-size link below the image.
+  const bits = [];
+  if (payload?.aspect_ratio) bits.push(payload.aspect_ratio);
+  if (payload?.resolution) bits.push(payload.resolution);
+  if (payload?.cost_time_s != null) bits.push(`${Number(payload.cost_time_s).toFixed(1)}s`);
+  if (payload?.model && typeof MODEL_META !== "undefined" && MODEL_META[payload.model]) {
+    bits.push(MODEL_META[payload.model].label);
+  }
+  bits.push(`<a href="${escape(url)}" data-open>Open full size</a>`);
+  meta.innerHTML = bits.join(" · ");
+  meta.style.display = "flex";
+  meta.querySelectorAll("a[data-open]").forEach((a) => {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      app?.openLink({ url: a.getAttribute("href") }).catch(() => {});
+    });
+  });
+}
+
+// Either reveal immediately (no engaged player) or park the result until
+// the player crashes. Called from every success path.
+function revealOrDeferImage(url, payload, app) {
+  if (_humanIsPlaying()) {
+    _parkThumbnail(url, payload, app);
+  } else {
+    performReveal(url, payload, app);
+  }
+}
 function bootDinoIfPresent() {
   if (_activeDinoGame) {
     try { _activeDinoGame.destroy(); } catch (_) {}
@@ -1886,8 +2030,19 @@ function bootDinoIfPresent() {
   // crash the entire widget — at worst the game just doesn't show.
   requestAnimationFrame(() => {
     if (!preview || !preview.contains(wrap)) return;
-    try { _activeDinoGame = new DinoGame(wrap); }
-    catch (err) { console.warn("dino game failed to start:", err); }
+    try {
+      _activeDinoGame = new DinoGame(wrap);
+      // If the thumbnail arrived during a previous mount and is still
+      // parked, wire the new game's game-over to drain it. (For the
+      // common case the player has been playing this game instance the
+      // whole time, the callback is just sitting there waiting.)
+      _activeDinoGame.onGameOver = () => {
+        if (_pendingThumbnail) {
+          const { url, payload, app } = _pendingThumbnail;
+          performReveal(url, payload, app);
+        }
+      };
+    } catch (err) { console.warn("dino game failed to start:", err); }
   });
 }
 const _previewObserver = new MutationObserver(() => bootDinoIfPresent());
@@ -1899,6 +2054,29 @@ if (preview) {
 function setLoading(state) {
   if (state) {
     installLoader();
+    // A new generation supersedes any parked thumbnail from the prior
+    // run — drop it, reset the overlay back to "Generating Thumbnail",
+    // and the green dot back to red. Keep the game canvas itself
+    // (installLoader is idempotent on that side) so the player's run
+    // doesn't reset.
+    _pendingThumbnail = null;
+    if (preview) {
+      const dot = preview.querySelector(".gen-game-dot");
+      if (dot) dot.classList.remove("ready");
+      const status = preview.querySelector(".gen-game-status");
+      if (status) {
+        const dotNode = status.querySelector(".gen-game-dot");
+        status.textContent = "";
+        if (dotNode) status.appendChild(dotNode);
+        status.appendChild(document.createTextNode(" Generating Thumbnail"));
+      }
+      const subs = preview.querySelectorAll(".gen-game-sub");
+      const m = (typeof MODEL_META !== "undefined")
+        ? (MODEL_META[modelEl?.value] || MODEL_META["nano-banana-pro"])
+        : { label: "Nano Banana Pro" };
+      if (subs[0]) subs[0].textContent = m.label;
+      if (subs[1]) subs[1].textContent = "Usually 30 to 90 seconds";
+    }
     generateBtn.disabled = true;
     generateBtn.textContent = "Generating…";
   } else {
@@ -2142,23 +2320,10 @@ function render(payload, app, opts = {}) {
     if (preview) {
       if (hasInlineResult) {
         const url = payload.images[0];
-        preview.innerHTML = `<img src="${escape(url)}" referrerpolicy="no-referrer" alt="generated thumbnail">`;
-        const img = preview.querySelector("img");
-        if (img) img.addEventListener("click", () => { app.openLink({ url }).catch(() => {}); });
-        const bits = [];
-        if (payload.aspect_ratio) bits.push(payload.aspect_ratio);
-        if (payload.resolution) bits.push(payload.resolution);
-        if (payload.cost_time_s != null) bits.push(`${Number(payload.cost_time_s).toFixed(1)}s`);
-        if (payload.model && MODEL_META[payload.model]) bits.push(MODEL_META[payload.model].label);
-        bits.push(`<a href="${escape(url)}" data-open>Open full size</a>`);
-        meta.innerHTML = bits.join(" · ");
-        meta.style.display = "flex";
-        meta.querySelectorAll("a[data-open]").forEach((a) => {
-          a.addEventListener("click", (e) => {
-            e.preventDefault();
-            app.openLink({ url: a.getAttribute("href") }).catch(() => {});
-          });
-        });
+        // Defer the DOM swap if the player is still running their dino;
+        // otherwise fade the image in over the canvas. Either way the
+        // payload gets persisted so refresh restores correctly.
+        revealOrDeferImage(url, payload, app);
         lastResultPayload = payload;
         lastSuccessPayload = payload;
         saveState();
@@ -2308,24 +2473,10 @@ function render(payload, app, opts = {}) {
     return;
   }
   const url = images[0];
-  preview.innerHTML = `<img src="${escape(url)}" referrerpolicy="no-referrer" alt="generated thumbnail">`;
-  preview.querySelector("img").addEventListener("click", () => {
-    app.openLink({ url }).catch(() => {});
-  });
-
-  const bits = [];
-  if (payload.aspect_ratio) bits.push(payload.aspect_ratio);
-  if (payload.resolution) bits.push(payload.resolution);
-  if (payload.cost_time_s != null) bits.push(`${Number(payload.cost_time_s).toFixed(1)}s`);
-  bits.push(`<a href="${escape(url)}" data-open>Open full size</a>`);
-  meta.innerHTML = bits.join(" · ");
-  meta.style.display = "flex";
-  meta.querySelectorAll("a[data-open]").forEach((a) => {
-    a.addEventListener("click", (e) => {
-      e.preventDefault();
-      app.openLink({ url: a.getAttribute("href") }).catch(() => {});
-    });
-  });
+  // Defer the DOM swap if the player is still running their dino;
+  // otherwise fade the image in over the canvas. revealOrDeferImage
+  // owns the meta line too.
+  revealOrDeferImage(url, payload, app);
   setLoading(false);
   // Persist successful generation so chat close/reopen restores the image
   // instead of dropping the user back at the picker. ALSO mirror into
