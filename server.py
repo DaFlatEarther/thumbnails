@@ -25,6 +25,7 @@ from typing import Annotated
 
 import requests
 from dotenv import load_dotenv
+from pydantic import Field
 from mcp.server.fastmcp import FastMCP
 
 load_dotenv()
@@ -969,16 +970,16 @@ def _build_mcp() -> FastMCP:
         meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
     )
     async def generate_thumbnail_tool(
-        prompt: Annotated[str, "Describe the SUBJECT and SCENE — who's on camera (or what the visual is about), what's happening, key props, and any text overlay the user wants. You don't need to specify composition / layout / color rules — the server applies them via the style_preset. Focus the prompt on content; let the preset handle composition."],
-        aspect_ratio: Annotated[str, "16:9 / 9:16 / 1:1 / 4:5 / 4:3 / 3:2 / 21:9 / auto. Default 16:9 (YouTube thumbnail)."] = "16:9",
-        resolution: Annotated[str, "1K / 2K / 4K. Default 2K — plenty for thumbnails and ~4× faster than 4K."] = "2K",
-        reference_urls: Annotated[list[str] | None, "Up to 8 reference inputs. Each can be a YouTube URL (watch / shorts / youtu.be / embed / live), a bare 11-char video ID, an i.ytimg.com URL, or any direct image URL. YouTube URLs are auto-resolved to the video's hqdefault thumbnail server-side."] = None,
-        reference_images: Annotated[list[str] | None, "Alias for `reference_urls`, accepted for back-compat. Prefer reference_urls in new code."] = None,
-        style_preset: Annotated[str, "Composition preset prepended to the prompt. Pick based on whether the video has a face on camera:\n• 'person_focal' (DEFAULT) — for videos featuring a real on-camera creator. Person on the left, face large/expressive, big text right, cutout depth, cinematic lighting (Unlayered / Pitagoras / MrBeast style).\n• 'faceless' — for videos with NO on-camera person (challenge series, business case studies, explainers, ASMR/cooking close-ups, tier-list style). Dominant centered hero object/scene tells the story via metaphor or juxtaposition; large decorative text; spotlight or editorial lighting; dark bg + single accent color.\n• 'none' — pass prompt verbatim with no composition guidance. Use ONLY when the user has very specific creative direction that would conflict with a preset.\nPick faceless if the video idea doesn't naturally include a person on camera, even if the user didn't say 'faceless' explicitly."] = "person_focal",
-        find_outliers_first: Annotated[bool, "Auto-pick path: fetch viral references from algrow and use the top 3 as reference_urls in the SAME call. ONLY set True when the user has explicitly opted into auto-pick (e.g. 'just pick a good reference for me', 'surprise me', 'don't make me choose'). Default UX is the two-step flow where the user picks ONE reference themselves — call find_outlier_references first for that, then call generate_thumbnail with the user's chosen reference_url. Use `outlier_topic` to keep the algrow search query short."] = False,
-        outlier_topic: Annotated[str | None, "Topic to search algrow for when find_outliers_first=True. Defaults to `prompt` if unset, but keeping this short (2-3 words: 'Vietnam rail', 'Amazon Prime', 'Minecraft 100 days') gives much better outlier matches than a full prompt."] = None,
-        analyze_references: Annotated[bool, "When True (default) AND reference_urls are provided, the server first runs Gemini vision on the references to extract a structured design breakdown (composition, palette, lighting, text style, etc.), then folds those template rules into the prompt. Result: Gemini's image-gen keeps the reference's design system but swaps the subject for the user's. Adds 5–15s of latency. Set False to skip and pass references as loose visual hints only."] = True,
-        model: Annotated[str, "Image-gen backend. CRITICAL: model determines how the reference is used.\n• 'nano-banana-pro' (DEFAULT) — Gemini 3 Pro Image direct. REGENERATES a fresh image from the prompt; reference is a style hint only. Highest quality. Safety filter blocks named real people / recognizable brands / references containing public figures (BlockedReason.OTHER).\n• 'seedream-5.0-lite' — Algrow proxy. REGENERATES from prompt with optional reference as style hint. More permissive filter — pick this when Nano Banana Pro keeps blocking AND the user wants a DIFFERENT subject from the reference. Right answer for biography / brand-history thumbnails that need the reference's design language but a new subject.\n• 'seedream-4.5-edit' — Algrow proxy, IMAGE-TO-IMAGE. EDITS the reference (preserves identity, layout, pose). ONLY appropriate when the user wants to keep the reference's subject and just tweak details. Returning the same person doing the same thing is the EXPECTED behavior of this model, not a bug.\nDefault to seedream-5.0-lite (not -4.5-edit) when Nano Banana Pro blocks on a biography / public-figure / brand piece."] = "nano-banana-pro",
+        prompt: Annotated[str, Field(description="Describe the SUBJECT and SCENE — who's on camera (or what the visual is about), what's happening, key props, and any text overlay the user wants. You don't need to specify composition / layout / color rules — the server applies them via the style_preset. Focus the prompt on content; let the preset handle composition.")],
+        aspect_ratio: Annotated[str, Field(description="16:9 / 9:16 / 1:1 / 4:5 / 4:3 / 3:2 / 21:9 / auto. Default 16:9 (YouTube thumbnail).")] = "16:9",
+        resolution: Annotated[str, Field(description="1K / 2K / 4K. Default 2K — plenty for thumbnails and ~4× faster than 4K.")] = "2K",
+        reference_urls: Annotated[list[str] | None, Field(description="Up to 8 reference inputs. Each can be a YouTube URL (watch / shorts / youtu.be / embed / live), a bare 11-char video ID, an i.ytimg.com URL, or any direct image URL. YouTube URLs are auto-resolved to the video's hqdefault thumbnail server-side.")] = None,
+        reference_images: Annotated[list[str] | None, Field(description="Alias for `reference_urls`, accepted for back-compat. Prefer reference_urls in new code.")] = None,
+        style_preset: Annotated[str, Field(description="Composition preset prepended to the prompt. Pick based on whether the video has a face on camera:\n• 'person_focal' (DEFAULT) — for videos featuring a real on-camera creator. Person on the left, face large/expressive, big text right, cutout depth, cinematic lighting (Unlayered / Pitagoras / MrBeast style).\n• 'faceless' — for videos with NO on-camera person (challenge series, business case studies, explainers, ASMR/cooking close-ups, tier-list style). Dominant centered hero object/scene tells the story via metaphor or juxtaposition; large decorative text; spotlight or editorial lighting; dark bg + single accent color.\n• 'none' — pass prompt verbatim with no composition guidance. Use ONLY when the user has very specific creative direction that would conflict with a preset.\nPick faceless if the video idea doesn't naturally include a person on camera, even if the user didn't say 'faceless' explicitly.")] = "person_focal",
+        find_outliers_first: Annotated[bool, Field(description="Auto-pick path: fetch viral references from algrow and use the top 3 as reference_urls in the SAME call. ONLY set True when the user has explicitly opted into auto-pick (e.g. 'just pick a good reference for me', 'surprise me', 'don't make me choose'). Default UX is the two-step flow where the user picks ONE reference themselves — call find_outlier_references first for that, then call generate_thumbnail with the user's chosen reference_url. Use `outlier_topic` to keep the algrow search query short.")] = False,
+        outlier_topic: Annotated[str | None, Field(description="Topic to search algrow for when find_outliers_first=True. Defaults to `prompt` if unset, but keeping this short (2-3 words: 'Vietnam rail', 'Amazon Prime', 'Minecraft 100 days') gives much better outlier matches than a full prompt.")] = None,
+        analyze_references: Annotated[bool, Field(description="When True (default) AND reference_urls are provided, the server first runs Gemini vision on the references to extract a structured design breakdown (composition, palette, lighting, text style, etc.), then folds those template rules into the prompt. Result: Gemini's image-gen keeps the reference's design system but swaps the subject for the user's. Adds 5–15s of latency. Set False to skip and pass references as loose visual hints only.")] = True,
+        model: Annotated[str, Field(description="Image-gen backend. CRITICAL: model determines how the reference is used.\n• 'nano-banana-pro' (DEFAULT) — Gemini 3 Pro Image direct. REGENERATES a fresh image from the prompt; reference is a style hint only. Highest quality. Safety filter blocks named real people / recognizable brands / references containing public figures (BlockedReason.OTHER).\n• 'seedream-5.0-lite' — Algrow proxy. REGENERATES from prompt with optional reference as style hint. More permissive filter — pick this when Nano Banana Pro keeps blocking AND the user wants a DIFFERENT subject from the reference. Right answer for biography / brand-history thumbnails that need the reference's design language but a new subject.\n• 'seedream-4.5-edit' — Algrow proxy, IMAGE-TO-IMAGE. EDITS the reference (preserves identity, layout, pose). ONLY appropriate when the user wants to keep the reference's subject and just tweak details. Returning the same person doing the same thing is the EXPECTED behavior of this model, not a bug.\nDefault to seedream-5.0-lite (not -4.5-edit) when Nano Banana Pro blocks on a biography / public-figure / brand piece.")] = "nano-banana-pro",
     ) -> str:
         import json
 
@@ -1139,15 +1140,15 @@ def _build_mcp() -> FastMCP:
         meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
     )
     async def check_thumbnail_status_tool(
-        task_id: Annotated[str, "The task_id returned by generate_thumbnail."],
-        prompt: Annotated[str, "Original prompt (echoed back to the widget so its form state is preserved across polls)."] = "",
-        aspect_ratio: Annotated[str, "Echoed back to the widget."] = "16:9",
-        resolution: Annotated[str, "Echoed back to the widget."] = "2K",
-        reference_urls: Annotated[list[str] | None, "Echoed back to the widget so the reference thumbnails stay visible during polling."] = None,
-        style_preset: Annotated[str, "Echoed back to the widget so the preset dropdown stays in sync across polls (otherwise the second poll wipes the value Claude originally chose)."] = "person_focal",
-        outliers: Annotated[list[dict] | None, "Echoed back to the widget so the outlier grid persists across polling rounds. Widget sends this when the original generate_thumbnail call had find_outliers_first=True."] = None,
-        outlier_topic: Annotated[str | None, "Echoed back; lets the widget keep the outlier-section header label."] = None,
-        model: Annotated[str, "Echoed back so the model dropdown stays in sync across polls."] = "nano-banana-pro",
+        task_id: Annotated[str, Field(description="The task_id returned by generate_thumbnail.")],
+        prompt: Annotated[str, Field(description="Original prompt (echoed back to the widget so its form state is preserved across polls).")] = "",
+        aspect_ratio: Annotated[str, Field(description="Echoed back to the widget.")] = "16:9",
+        resolution: Annotated[str, Field(description="Echoed back to the widget.")] = "2K",
+        reference_urls: Annotated[list[str] | None, Field(description="Echoed back to the widget so the reference thumbnails stay visible during polling.")] = None,
+        style_preset: Annotated[str, Field(description="Echoed back to the widget so the preset dropdown stays in sync across polls (otherwise the second poll wipes the value Claude originally chose).")] = "person_focal",
+        outliers: Annotated[list[dict] | None, Field(description="Echoed back to the widget so the outlier grid persists across polling rounds. Widget sends this when the original generate_thumbnail call had find_outliers_first=True.")] = None,
+        outlier_topic: Annotated[str | None, Field(description="Echoed back; lets the widget keep the outlier-section header label.")] = None,
+        model: Annotated[str, Field(description="Echoed back so the model dropdown stays in sync across polls.")] = "nano-banana-pro",
     ) -> str:
         import json
 
@@ -1234,7 +1235,7 @@ def _build_mcp() -> FastMCP:
             ),
         )
         async def analyze_thumbnail_tool(
-            image_url: Annotated[str, "Public HTTPS image URL to analyze. Accepts any image; YouTube hqdefault URLs work great."],
+            image_url: Annotated[str, Field(description="Public HTTPS image URL to analyze. Accepts any image; YouTube hqdefault URLs work great.")],
         ) -> str:
             import json
             analysis, error = _analyze_image_via_gemini(image_url)
@@ -1265,10 +1266,10 @@ def _build_mcp() -> FastMCP:
             ),
         )
         async def compose_thumbnail_prompt_tool(
-            title: Annotated[str, "What the thumbnail is about — usually the user's video title."],
-            reference_url: Annotated[str, "The reference thumbnail URL the user picked. YouTube URLs / IDs / image URLs all accepted."],
-            reference_title: Annotated[str | None, "The ORIGINAL video title that the reference thumbnail was made for. PASS THIS whenever you have it (it comes back as `title` on each outlier from find_outlier_references). Without it, the mapping is forced to photocopy visuals; with it, Gemini can reason about WHY the reference's design choices fit ITS title before adapting that logic to the user's NEW title."] = None,
-            style_preset: Annotated[str, "person_focal | faceless | none. Default person_focal."] = "person_focal",
+            title: Annotated[str, Field(description="What the thumbnail is about — usually the user's video title.")],
+            reference_url: Annotated[str, Field(description="The reference thumbnail URL the user picked. YouTube URLs / IDs / image URLs all accepted.")],
+            reference_title: Annotated[str | None, Field(description="The ORIGINAL video title that the reference thumbnail was made for. PASS THIS whenever you have it (it comes back as `title` on each outlier from find_outlier_references). Without it, the mapping is forced to photocopy visuals; with it, Gemini can reason about WHY the reference's design choices fit ITS title before adapting that logic to the user's NEW title.")] = None,
+            style_preset: Annotated[str, Field(description="person_focal | faceless | none. Default person_focal.")] = "person_focal",
         ) -> str:
             """Single-call reasoned compose:
               1. One multimodal Gemini call sees the reference image + its
@@ -1366,11 +1367,11 @@ def _build_mcp() -> FastMCP:
             meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
         )
         async def find_outlier_references_tool(
-            topic: Annotated[str, "Algrow semantic search query. When `title` is being passed, set `topic` to the EXACT SAME STRING as `title` (verbatim, no elaboration, no keyword expansion, no rewording). Algrow's semantic search handles full titles fine, and your elaborated versions actually retrieve worse — they over-generalize the query and surface off-topic outliers. ONLY produce a different `topic` value when no `title` is available (e.g. the user just said 'show me viral elephant thumbnails' with no specific video idea) — in that case keep it short, 2–4 words."],
-            title: Annotated[str | None, "The user's video title — what the thumbnail is for. e.g. 'Why Amazon Prime is Failing', 'Every Elephant Explained in 11 Minutes'. The widget pre-fills its TITLE field with this AND the server uses it as the basis for the engineered prompt after the user picks a reference. ALWAYS pass this when you have the title. When you pass it, `topic` should be set to this same string verbatim — see the `topic` field doc."] = None,
-            content_type: Annotated[str, "longform or shorts. Default longform."] = "longform",
-            limit: Annotated[int, "Max thumbnails to return. Default 12, capped at 24."] = 12,
-            min_outlier_score: Annotated[float, "Floor on outlier multiplier — only include videos that outperformed their channel average by at least this factor. Default 2.0 (validated against hand-eval: lower lets in too much noise, higher misses too many strong references)."] = 2.0,
+            topic: Annotated[str, Field(description="Algrow semantic search query. When `title` is being passed, set `topic` to the EXACT SAME STRING as `title` (verbatim, no elaboration, no keyword expansion, no rewording). Algrow's semantic search handles full titles fine, and your elaborated versions actually retrieve worse — they over-generalize the query and surface off-topic outliers. ONLY produce a different `topic` value when no `title` is available (e.g. the user just said 'show me viral elephant thumbnails' with no specific video idea) — in that case keep it short, 2–4 words.")],
+            title: Annotated[str | None, Field(description="The user's video title — what the thumbnail is for. e.g. 'Why Amazon Prime is Failing', 'Every Elephant Explained in 11 Minutes'. The widget pre-fills its TITLE field with this AND the server uses it as the basis for the engineered prompt after the user picks a reference. ALWAYS pass this when you have the title. When you pass it, `topic` should be set to this same string verbatim — see the `topic` field doc.")] = None,
+            content_type: Annotated[str, Field(description="longform or shorts. Default longform.")] = "longform",
+            limit: Annotated[int, Field(description="Max thumbnails to return. Default 12, capped at 24.")] = 12,
+            min_outlier_score: Annotated[float, Field(description="Floor on outlier multiplier — only include videos that outperformed their channel average by at least this factor. Default 2.0 (validated against hand-eval: lower lets in too much noise, higher misses too many strong references).")] = 2.0,
         ) -> str:
             """DEFAULT entry point when the user wants a thumbnail and a
             title is available. Drives a three-step in-widget flow that the
@@ -1452,12 +1453,12 @@ def _build_mcp() -> FastMCP:
         meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
     )
     async def generate_thumbnail_from_video_alias(
-        user_title: Annotated[str, "The user's NEW video title — what THEIR thumbnail is for."],
-        reference_video_url: Annotated[str, "YouTube URL of the reference video the user wants to base the design on."],
-        style_preset: Annotated[str, "person_focal | faceless | none. Default 'none'."] = "none",
-        aspect_ratio: Annotated[str, "16:9 / 9:16 / etc. Default 16:9."] = "16:9",
-        resolution: Annotated[str, "1K / 2K / 4K. Default 2K."] = "2K",
-        model: Annotated[str, "nano-banana-pro | seedream-4.5-edit | seedream-5.0-lite. See canonical tool for behavior."] = "nano-banana-pro",
+        user_title: Annotated[str, Field(description="The user's NEW video title — what THEIR thumbnail is for.")],
+        reference_video_url: Annotated[str, Field(description="YouTube URL of the reference video the user wants to base the design on.")],
+        style_preset: Annotated[str, Field(description="person_focal | faceless | none. Default 'none'.")] = "none",
+        aspect_ratio: Annotated[str, Field(description="16:9 / 9:16 / etc. Default 16:9.")] = "16:9",
+        resolution: Annotated[str, Field(description="1K / 2K / 4K. Default 2K.")] = "2K",
+        model: Annotated[str, Field(description="nano-banana-pro | seedream-4.5-edit | seedream-5.0-lite. See canonical tool for behavior.")] = "nano-banana-pro",
     ) -> str:
         # Forward directly to the canonical tool's behavior.
         return await extract_reference_from_video_tool(
@@ -1492,9 +1493,9 @@ def _build_mcp() -> FastMCP:
         meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
     )
     async def extract_reference_from_video_tool(
-        url_or_id: Annotated[str, "YouTube URL (watch / shorts / youtu.be / embed / live) or bare 11-character video ID."],
-        user_title: Annotated[str | None, "The user's NEW video title — what THEIR thumbnail is for (different from the reference video's own title). Widget pre-fills its title field with this. Always pass when you have it."] = None,
-        model: Annotated[str, "Image-gen backend the widget should preselect. The model dictates HOW the reference is used:\n• 'nano-banana-pro' (DEFAULT) — Gemini 3 Pro Image direct. Highest quality, REGENERATES a fresh image from the prompt + reference as a style hint. Safety filter blocks named real people / brands / references containing public figures (returns BlockedReason.OTHER).\n• 'seedream-5.0-lite' — Algrow proxy, REGENERATES from prompt with optional reference as style hint. More permissive safety filter than Gemini direct — use this when the user's title is a biography / brand-history / public-figure piece and Nano Banana Pro keeps blocking. This is the RIGHT seedream variant for 'thumbnail inspired by reference but with a different subject', because it actually generates a new subject.\n• 'seedream-4.5-edit' — Algrow proxy, IMAGE-TO-IMAGE. Edits the reference rather than regenerating; preserves identity, layout, and pose of the subject. Use this ONLY when the user wants to keep most of the reference and just tweak details. NOT appropriate when the user wants the design pattern applied to a different subject — it'll return the same person doing the same thing.\n\nDecision tree: blocked by Gemini AND wants a different subject from the reference → seedream-5.0-lite. Wants the SAME subject with minor edits → seedream-4.5-edit. Otherwise → nano-banana-pro."] = "nano-banana-pro",
+        url_or_id: Annotated[str, Field(description="YouTube URL (watch / shorts / youtu.be / embed / live) or bare 11-character video ID.")],
+        user_title: Annotated[str | None, Field(description="The user's NEW video title — what THEIR thumbnail is for (different from the reference video's own title). Widget pre-fills its title field with this. Always pass when you have it.")] = None,
+        model: Annotated[str, Field(description="Image-gen backend the widget should preselect. The model dictates HOW the reference is used:\n• 'nano-banana-pro' (DEFAULT) — Gemini 3 Pro Image direct. Highest quality, REGENERATES a fresh image from the prompt + reference as a style hint. Safety filter blocks named real people / brands / references containing public figures (returns BlockedReason.OTHER).\n• 'seedream-5.0-lite' — Algrow proxy, REGENERATES from prompt with optional reference as style hint. More permissive safety filter than Gemini direct — use this when the user's title is a biography / brand-history / public-figure piece and Nano Banana Pro keeps blocking. This is the RIGHT seedream variant for 'thumbnail inspired by reference but with a different subject', because it actually generates a new subject.\n• 'seedream-4.5-edit' — Algrow proxy, IMAGE-TO-IMAGE. Edits the reference rather than regenerating; preserves identity, layout, and pose of the subject. Use this ONLY when the user wants to keep most of the reference and just tweak details. NOT appropriate when the user wants the design pattern applied to a different subject — it'll return the same person doing the same thing.\n\nDecision tree: blocked by Gemini AND wants a different subject from the reference → seedream-5.0-lite. Wants the SAME subject with minor edits → seedream-4.5-edit. Otherwise → nano-banana-pro.")] = "nano-banana-pro",
     ) -> str:
         import json
         # Fresh task invocation — clear any saved WIP for this title so the
@@ -1576,7 +1577,7 @@ def _build_mcp() -> FastMCP:
         ),
     )
     async def get_widget_prompt_tool(
-        user_title: Annotated[str, "The user's video title — same value used when the original compose ran. State is keyed by this."],
+        user_title: Annotated[str, Field(description="The user's video title — same value used when the original compose ran. State is keyed by this.")],
     ) -> str:
         import json
         bucket = _load_state_bucket()
@@ -1614,8 +1615,8 @@ def _build_mcp() -> FastMCP:
         meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
     )
     async def set_widget_prompt_tool(
-        user_title: Annotated[str, "The user's video title — same value used when the original compose ran. State is keyed by this."],
-        new_prompt: Annotated[str, "The edited engineered prompt to save. Goes verbatim into the widget's prompt textarea and is sent verbatim to the image-gen model when the user clicks Generate. Preserve every unchanged detail from the original prompt — refinements should be surgical, not wholesale rewrites."],
+        user_title: Annotated[str, Field(description="The user's video title — same value used when the original compose ran. State is keyed by this.")],
+        new_prompt: Annotated[str, Field(description="The edited engineered prompt to save. Goes verbatim into the widget's prompt textarea and is sent verbatim to the image-gen model when the user clicks Generate. Preserve every unchanged detail from the original prompt — refinements should be surgical, not wholesale rewrites.")],
     ) -> str:
         import json
         bucket = _load_state_bucket()
@@ -1672,8 +1673,8 @@ def _build_mcp() -> FastMCP:
         ),
     )
     async def save_widget_state_tool(
-        key: Annotated[str, "Lowercased, trimmed video title used as the bucket key."],
-        state: Annotated[dict, "Opaque state blob the widget wants to persist. Stored as-is."],
+        key: Annotated[str, Field(description="Lowercased, trimmed video title used as the bucket key.")],
+        state: Annotated[dict, Field(description="Opaque state blob the widget wants to persist. Stored as-is.")],
     ) -> str:
         import json
         k = _state_key(key)
@@ -1699,7 +1700,7 @@ def _build_mcp() -> FastMCP:
         ),
     )
     async def load_widget_state_tool(
-        key: Annotated[str, "Lowercased, trimmed video title used as the bucket key."],
+        key: Annotated[str, Field(description="Lowercased, trimmed video title used as the bucket key.")],
     ) -> str:
         import json
         k = _state_key(key)
