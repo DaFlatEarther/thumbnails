@@ -1253,7 +1253,13 @@ class DinoGame {
     document.addEventListener("keyup", this._onKeyUp);
     wrapper.addEventListener("pointerdown", this._onPointer);
     window.addEventListener("resize", this._onResize);
-    this.best = Number(localStorage.getItem(_GAME_BEST_KEY) || 0) | 0;
+    // localStorage access throws SecurityError in sandboxed iframes that
+    // lack allow-same-origin (Claude widgets sometimes run that way), so
+    // wrap the read AND the write. Falls back to 0; high-score then only
+    // lives for the session.
+    this.best = 0;
+    try { this.best = Number(localStorage.getItem(_GAME_BEST_KEY) || 0) | 0; }
+    catch (_) {}
     this.reset();
     this.alive = true;
     this.lastTs = performance.now();
@@ -1852,19 +1858,26 @@ class DinoGame {
 // the game cleans up itself when the loader is replaced by the image.
 let _activeDinoGame = null;
 function bootDinoIfPresent() {
-  if (_activeDinoGame) { _activeDinoGame.destroy(); _activeDinoGame = null; }
-  const wrap = preview?.querySelector(".gen-game");
-  if (wrap) {
-    // RAF defer so the canvas has its final layout size before we read it.
-    requestAnimationFrame(() => {
-      if (!preview.contains(wrap)) return;
-      _activeDinoGame = new DinoGame(wrap);
-    });
+  if (_activeDinoGame) {
+    try { _activeDinoGame.destroy(); } catch (_) {}
+    _activeDinoGame = null;
   }
+  const wrap = preview?.querySelector(".gen-game");
+  if (!wrap) return;
+  // RAF defer so the canvas has its final layout size before we read it.
+  // Wrap construction so a runtime issue in the game (e.g. canvas APIs
+  // unavailable in an unusual iframe sandbox) doesn't bubble up and
+  // crash the entire widget — at worst the game just doesn't show.
+  requestAnimationFrame(() => {
+    if (!preview || !preview.contains(wrap)) return;
+    try { _activeDinoGame = new DinoGame(wrap); }
+    catch (err) { console.warn("dino game failed to start:", err); }
+  });
 }
 const _previewObserver = new MutationObserver(() => bootDinoIfPresent());
-if (typeof preview !== "undefined" && preview) {
-  _previewObserver.observe(preview, { childList: true, subtree: false });
+if (preview) {
+  try { _previewObserver.observe(preview, { childList: true, subtree: false }); }
+  catch (_) {}
 }
 
 function setLoading(state) {
