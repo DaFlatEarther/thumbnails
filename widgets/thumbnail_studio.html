@@ -1044,12 +1044,12 @@ async function runAutoPipeline(app, ref, title) {
       const text = res?.content?.[0]?.text ?? "";
       composeData = text ? JSON.parse(text) : null;
     } catch (err) {
-      if (preview) preview.innerHTML = `<div class="err">Compose failed: ${escape(err.message || String(err))}</div>`;
+      _safeReplacePreview(`<div class="err">Compose failed: ${escape(err.message || String(err))}</div>`);
       setLoading(false);
       return;
     }
     if (!composeData?.success || !composeData?.prompt) {
-      if (preview) preview.innerHTML = `<div class="err">Compose returned no prompt: ${escape(composeData?.error || "unknown")}</div>`;
+      _safeReplacePreview(`<div class="err">Compose returned no prompt: ${escape(composeData?.error || "unknown")}</div>`);
       setLoading(false);
       return;
     }
@@ -1081,7 +1081,7 @@ async function runAutoPipeline(app, ref, title) {
       const text = res?.content?.[0]?.text ?? "";
       genData = text ? JSON.parse(text) : null;
     } catch (err) {
-      if (preview) preview.innerHTML = `<div class="err">Generation failed: ${escape(err.message || String(err))}</div>`;
+      _safeReplacePreview(`<div class="err">Generation failed: ${escape(err.message || String(err))}</div>`);
       setLoading(false);
       return;
     }
@@ -2014,6 +2014,17 @@ function revealOrDeferImage(url, payload, app) {
     performReveal(url, payload, app);
   }
 }
+
+// Belt-and-braces guard for every OTHER place we'd nuke the preview pane
+// (error / empty / hint fallbacks). Refuses to touch the DOM while the
+// dino game is running — the player's run survives no matter which code
+// path fires. Returns true if the swap happened.
+function _safeReplacePreview(html) {
+  if (!preview) return false;
+  if (_gameIsRunning()) return false;
+  preview.innerHTML = html;
+  return true;
+}
 function bootDinoIfPresent() {
   if (_activeDinoGame) {
     try { _activeDinoGame.destroy(); } catch (_) {}
@@ -2125,7 +2136,7 @@ function startPolling(taskId, app, opts) {
     if (activePollTaskId !== taskId) return;  // superseded by a newer gen
     if ((Date.now() - start) / 1000 > MAX_POLL_S) {
       stopPolling();
-      preview.innerHTML = `<div class="err">Timed out waiting for Kie (>${MAX_POLL_S}s)</div>`;
+      _safeReplacePreview(`<div class="err">Timed out waiting for Kie (>${MAX_POLL_S}s)</div>`);
       setLoading(false);
       return;
     }
@@ -2169,7 +2180,7 @@ function startPolling(taskId, app, opts) {
 
 function render(payload, app, opts = {}) {
   if (!payload) {
-    preview.innerHTML = `<div class="empty">No data.</div>`;
+    _safeReplacePreview(`<div class="empty">No data.</div>`);
     meta.style.display = "none";
     return;
   }
@@ -2325,14 +2336,14 @@ function render(payload, app, opts = {}) {
         lastSuccessPayload = payload;
         saveState();
       } else if (hasInlineError) {
-        preview.innerHTML = `<div class="err">${escape(payload.error || "Generation failed")}</div>`;
+        _safeReplacePreview(`<div class="err">${escape(payload.error || "Generation failed")}</div>`);
         meta.style.display = "none";
       } else if (payload.refined_prompt) {
-        preview.innerHTML = `<div class="empty">Prompt refined and ready below — review the changes, then click <b>Generate</b>.</div>`;
+        _safeReplacePreview(`<div class="empty">Prompt refined and ready below — review the changes, then click <b>Generate</b>.</div>`);
       } else {
-        preview.innerHTML = payload.single_reference
+        _safeReplacePreview(payload.single_reference
           ? `<div class="empty">Reference loaded.  Confirm the title above, then click <b>Create Prompt</b>, then <b>Generate</b>.</div>`
-          : `<div class="empty">1. Confirm the title above.  2. Pick a reference below.  3. Click <b>Create Prompt</b>.  4. Click <b>Generate</b>.</div>`;
+          : `<div class="empty">1. Confirm the title above.  2. Pick a reference below.  3. Click <b>Create Prompt</b>.  4. Click <b>Generate</b>.</div>`);
       }
     }
     refreshComposeRow();
@@ -2451,7 +2462,7 @@ function render(payload, app, opts = {}) {
   stopPolling();
 
   if (payload.state === "fail" || payload.error) {
-    preview.innerHTML = `<div class="err">${escape(payload.error || "Generation failed")}</div>`;
+    _safeReplacePreview(`<div class="err">${escape(payload.error || "Generation failed")}</div>`);
     meta.style.display = "none";
     setLoading(false);
     // Persist the failure too so reopening the chat doesn't silently drop
@@ -2464,7 +2475,7 @@ function render(payload, app, opts = {}) {
   }
   const images = Array.isArray(payload.images) ? payload.images : [];
   if (images.length === 0) {
-    preview.innerHTML = `<div class="empty">Generation returned no image.</div>`;
+    _safeReplacePreview(`<div class="empty">Generation returned no image.</div>`);
     meta.style.display = "none";
     setLoading(false);
     return;
@@ -2571,7 +2582,7 @@ function initDropdowns() {
       const data = text ? JSON.parse(text) : null;
       render(data, app);
     } catch (err) {
-      preview.innerHTML = `<div class="err">Bad payload: ${escape(err.message)}</div>`;
+      _safeReplacePreview(`<div class="err">Bad payload: ${escape(err.message)}</div>`);
     }
   };
   app.onhostcontextchanged = applyHostContext;
@@ -2761,7 +2772,7 @@ function initDropdowns() {
       const data = text ? JSON.parse(text) : null;
       render(data, app);
     } catch (err) {
-      preview.innerHTML = `<div class="err">Request failed: ${escape(err.message)}</div>`;
+      _safeReplacePreview(`<div class="err">Request failed: ${escape(err.message)}</div>`);
       setLoading(false);
     }
   });
