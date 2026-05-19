@@ -243,41 +243,65 @@
     .gen-loader-bar-fill, .gen-loader-bar-fill::after { animation: none; }
   }
 
-  /* Dino runner — playable while a generation is in flight. Sits under the
-     loader label, replaces itself with nothing when the loader is torn down
-     (innerHTML swap kills the canvas + listeners). */
-  .dino-wrap {
-    position: relative;
-    margin-top: 14px;
-    width: 100%;
-    max-width: 360px;
-  }
-  .dino-canvas {
-    width: 100%;
-    height: 100px;
-    display: block;
-    border-radius: 8px;
-    background: rgba(0,0,0,0.45);
-    border: 1px solid rgba(255,255,255,0.08);
+  /* Chrome dino runner as the loader. The whole preview pane IS the game.
+     Authentic palette: white bg + #535353 graphics. Night mode flips at
+     score milestones. The DM-Sans status overlay sits in the top-left
+     corner; everything else is drawn on canvas. */
+  .gen-game {
+    position: absolute;
+    inset: 0;
+    background: #f7f7f7;
+    overflow: hidden;
     cursor: pointer;
+  }
+  .gen-game.night { background: #535353; }
+  .gen-game-canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
     outline: none;
   }
-  .dino-canvas:focus { border-color: var(--accent); }
-  .dino-hint {
-    margin-top: 6px;
-    font-size: 10.5px;
-    color: rgba(255,255,255,0.55);
-    text-align: center;
-    letter-spacing: 0.02em;
+  .gen-game-overlay {
+    position: absolute;
+    top: 14px;
+    left: 16px;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    pointer-events: none;  /* don't steal canvas clicks */
   }
-  .dino-hint kbd {
-    background: rgba(255,255,255,0.1);
-    border: 1px solid rgba(255,255,255,0.15);
-    border-radius: 4px;
-    padding: 1px 5px;
-    font-family: inherit;
-    font-size: 10px;
+  .gen-game-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #535353;
+    font-family: "DM Sans", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+    font-size: 13px;
     font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .gen-game.night .gen-game-status,
+  .gen-game.night .gen-game-sub { color: #f7f7f7; }
+  .gen-game-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #e74c3c;
+    box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.5);
+    animation: gen-game-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes gen-game-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.55); opacity: 1; }
+    50%      { box-shadow: 0 0 0 8px rgba(231, 76, 60, 0);   opacity: 0.75; }
+  }
+  .gen-game-sub {
+    color: #888;
+    font-family: "DM Sans", -apple-system, BlinkMacSystemFont, system-ui, sans-serif !important;
+    font-size: 11.5px;
+    font-weight: 500;
+    line-height: 1.4;
   }
 
   .meta {
@@ -1161,38 +1185,25 @@ function renderRefThumbs() {
 }
 
 function loaderHtml(label, sub) {
-  // Inline SVG sparkle icon — four-pointed star with two small accent stars.
-  // Avoids pulling in a webfont (FontAwesome / Material) just for one glyph.
-  const icon =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
-      '<path d="M12 3l1.9 5.8a2 2 0 0 0 1.3 1.3L21 12l-5.8 1.9a2 2 0 0 0-1.3 1.3L12 21l-1.9-5.8a2 2 0 0 0-1.3-1.3L3 12l5.8-1.9a2 2 0 0 0 1.3-1.3L12 3z"/>' +
-      '<path d="M5 3v4"/><path d="M3 5h4"/>' +
-      '<path d="M19 17v4"/><path d="M17 19h4"/>' +
-    '</svg>';
+  // The loader IS the dino game. The whole preview pane becomes a runnable
+  // canvas; a small DM-Sans overlay sits in the top-left with status. We
+  // intentionally swallow `label` / `sub` parameters here — the caller's
+  // text used to vary by stage but the user wants a constant three-line
+  // status. The `model` global feeds the model name.
+  void label; void sub;
+  const m = (typeof MODEL_META !== "undefined" && MODEL_META[modelEl?.value])
+    || (typeof MODEL_META !== "undefined" && MODEL_META["nano-banana-pro"])
+    || { label: "Nano Banana Pro" };
   return (
-    '<div class="gen-loader">' +
-      '<div class="gen-loader-stage">' +
-        '<div class="gen-loader-ripple r1"></div>' +
-        '<div class="gen-loader-ripple r2"></div>' +
-        '<div class="gen-loader-ripple r3"></div>' +
-        '<div class="gen-loader-particle p1"></div>' +
-        '<div class="gen-loader-particle p2"></div>' +
-        '<div class="gen-loader-particle p3"></div>' +
-        '<div class="gen-loader-particle p4"></div>' +
-        '<div class="gen-loader-particle p5"></div>' +
-        '<div class="gen-loader-particle p6"></div>' +
-        '<div class="gen-loader-particle p7"></div>' +
-        '<div class="gen-loader-particle p8"></div>' +
-        '<div class="gen-loader-icon">' + icon + '</div>' +
-      '</div>' +
-      '<div class="gen-loader-inner">' +
-        (label ? `<div class="gen-loader-label">${escape(label)}</div>` : "") +
-        (sub ? `<div class="gen-loader-sub">${escape(sub)}</div>` : "") +
-        '<div class="gen-loader-bar"><div class="gen-loader-bar-fill"></div></div>' +
-        '<div class="dino-wrap">' +
-          '<canvas class="dino-canvas" tabindex="0" aria-label="Dino runner mini-game"></canvas>' +
-          '<div class="dino-hint">Click to focus · <kbd>Space</kbd> jump · <kbd>R</kbd> restart</div>' +
+    '<div class="gen-game" tabindex="0" aria-label="Dino runner — playable while your thumbnail generates">' +
+      '<canvas class="gen-game-canvas"></canvas>' +
+      '<div class="gen-game-overlay">' +
+        '<div class="gen-game-status">' +
+          '<span class="gen-game-dot"></span>' +
+          'Generating Thumbnail' +
         '</div>' +
+        `<div class="gen-game-sub">${escape(m.label)}</div>` +
+        '<div class="gen-game-sub">Usually 30 to 90 seconds</div>' +
       '</div>' +
     '</div>'
   );
@@ -1201,139 +1212,513 @@ function loaderHtml(label, sub) {
 // Tiny canvas-based dinosaur runner. Wires itself up to the .dino-canvas
 // inside the active loader; auto-tears-down via MutationObserver when the
 // preview pane's innerHTML is swapped (which happens on success/fail).
+// Endless-runner mini-game styled after the offline Chrome browser game:
+// white background, single-color (#535353) silhouette graphics, T-Rex
+// character that jumps over cacti, pterodactyl enemies later in the run,
+// and a day/night flip on score milestones. All graphics are path-drawn
+// from scratch (no sprite sheets, no external assets) and physics values
+// are hand-tuned to feel like a typical endless-runner.
+//
+// Persistent session high-score lives in localStorage when available.
+const _GAME_GRAY = "#535353";
+const _GAME_LIGHT = "#f7f7f7";
+const _GAME_BEST_KEY = "thumb-studio.dino-best";
+
 class DinoGame {
-  constructor(canvas) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext("2d");
-    // Match the canvas's CSS size at 2x DPR for crisp pixels.
+  constructor(wrapper) {
+    this.wrap = wrapper;
+    this.canvas = wrapper.querySelector(".gen-game-canvas");
+    this.ctx = this.canvas.getContext("2d");
+    this._resize();
+    this._onKey = this._onKey.bind(this);
+    this._onPointer = this._onPointer.bind(this);
+    this._onKeyUp = this._onKeyUp.bind(this);
+    this._onResize = this._resize.bind(this);
+    document.addEventListener("keydown", this._onKey);
+    document.addEventListener("keyup", this._onKeyUp);
+    wrapper.addEventListener("pointerdown", this._onPointer);
+    window.addEventListener("resize", this._onResize);
+    this.best = Number(localStorage.getItem(_GAME_BEST_KEY) || 0) | 0;
+    this.reset();
+    this.alive = true;
+    this.lastTs = performance.now();
+    this.raf = requestAnimationFrame(this._loop.bind(this));
+    // Focus the wrapper so spacebar works immediately on mount.
+    setTimeout(() => { try { wrapper.focus({ preventScroll: true }); } catch (_) {} }, 30);
+  }
+
+  _resize() {
     const dpr = Math.max(1, window.devicePixelRatio || 1);
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = Math.floor(rect.width * dpr);
-    canvas.height = Math.floor(rect.height * dpr);
-    this.ctx.scale(dpr, dpr);
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width < 10 || rect.height < 10) return;
+    this.canvas.width = Math.floor(rect.width * dpr);
+    this.canvas.height = Math.floor(rect.height * dpr);
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.w = rect.width;
     this.h = rect.height;
-    this.groundY = this.h - 16;
-    this.reset();
-    this.onKey = this.onKey.bind(this);
-    this.onPointer = this.onPointer.bind(this);
-    canvas.addEventListener("keydown", this.onKey);
-    canvas.addEventListener("pointerdown", this.onPointer);
-    this.raf = requestAnimationFrame(this.loop.bind(this));
-    this.alive = true;
+    this.groundY = Math.round(this.h * 0.78);
   }
+
   reset() {
-    this.dino = { x: 28, y: 0, vy: 0, size: 18, grounded: true };
-    this.obstacles = [];
-    this.speed = 3.2;        // px/frame, ramps up
-    this.spawnCooldown = 60; // frames until next spawn
+    this.t = 0;            // frames since start of run
     this.score = 0;
-    this.best = Math.max(this.best || 0, 0);
+    this.scoreAccum = 0;
+    this.speed = 6;        // baseline ground speed, px/frame
+    this.spawnTimer = 90;
+    this.obstacles = [];
+    this.clouds = [];
+    this.ground = this._initialGround();
     this.over = false;
     this.started = false;
+    this.night = false;
+    this.nightFlash = 0;   // animation timer for the day/night transition
+    this.lastMilestone = 0;
+    this.flashScore = 0;   // frames remaining of "achievement" pulse
+    this.dino = {
+      x: Math.max(36, this.w * 0.08),
+      y: 0,             // offset from ground; 0 = standing
+      vy: 0,
+      grounded: true,
+      ducking: false,
+      legPhase: 0,
+    };
+    this.holdDown = false;
   }
-  onPointer() { this.canvas.focus(); }
-  onKey(e) {
+
+  _initialGround() {
+    // Pre-fill the ground with random small bumps so it doesn't look bare
+    // on the first frame.
+    const arr = [];
+    for (let x = 0; x < this.w + 40; x += 3 + Math.random() * 9) {
+      arr.push({ x, h: Math.random() < 0.3 ? 2 : 1 });
+    }
+    return arr;
+  }
+
+  _onPointer(e) {
+    this.wrap.focus({ preventScroll: true });
+    // Tap-to-jump on mobile / casual click.
+    this._handleJumpInput();
+    e.preventDefault();
+  }
+
+  _onKey(e) {
+    // Only react when the wrapper is focused, OR when no input/textarea has
+    // focus (so the game doesn't hijack typing into prompt / title fields).
+    const active = document.activeElement;
+    const focusedOnGame = active === this.wrap || active === this.canvas;
+    const inField = active && /^(INPUT|TEXTAREA)$/i.test(active.tagName);
+    if (!focusedOnGame && inField) return;
+
     if (e.code === "Space" || e.code === "ArrowUp" || e.key === " ") {
       e.preventDefault();
-      if (this.over) { this.reset(); return; }
-      if (!this.started) this.started = true;
-      if (this.dino.grounded) {
-        this.dino.vy = -9.5;
-        this.dino.grounded = false;
+      this._handleJumpInput();
+    } else if (e.code === "ArrowDown") {
+      e.preventDefault();
+      this.holdDown = true;
+      if (!this.over && this.dino.grounded && this.started) {
+        this.dino.ducking = true;
       }
     } else if (e.key === "r" || e.key === "R") {
       e.preventDefault();
-      this.reset();
+      if (this.over) this.reset();
     }
   }
-  loop() {
+  _onKeyUp(e) {
+    if (e.code === "ArrowDown") {
+      this.holdDown = false;
+      this.dino.ducking = false;
+    }
+  }
+  _handleJumpInput() {
+    if (this.over) { this.reset(); return; }
+    if (!this.started) { this.started = true; return; }
+    if (this.dino.grounded) {
+      this.dino.vy = -10.5;
+      this.dino.grounded = false;
+      this.dino.ducking = false;
+    }
+  }
+
+  _loop(ts) {
     if (!this.alive) return;
-    this.update();
-    this.draw();
-    this.raf = requestAnimationFrame(this.loop.bind(this));
+    // Cap delta so a paused/backgrounded tab doesn't catapult the game
+    // forward on resume.
+    const dt = Math.min(40, ts - this.lastTs) / (1000 / 60);
+    this.lastTs = ts;
+    this._update(dt);
+    this._draw();
+    this.raf = requestAnimationFrame(this._loop.bind(this));
   }
-  update() {
-    if (!this.started || this.over) return;
-    // Dino physics.
-    this.dino.vy += 0.55;
-    this.dino.y += this.dino.vy;
-    if (this.dino.y >= 0) { this.dino.y = 0; this.dino.vy = 0; this.dino.grounded = true; }
-    // Obstacle motion.
-    for (const o of this.obstacles) o.x -= this.speed;
-    this.obstacles = this.obstacles.filter(o => o.x + o.w > -10);
-    // Spawn.
-    this.spawnCooldown--;
-    if (this.spawnCooldown <= 0) {
-      const h = 14 + Math.random() * 20;
-      this.obstacles.push({ x: this.w + 10, w: 10 + Math.random() * 8, h });
-      this.spawnCooldown = Math.floor(50 + Math.random() * 50);
+
+  _update(dt) {
+    if (!this.started || this.over) {
+      // Idle ground scroll so the world doesn't look frozen.
+      this._scrollGround(this.started ? this.speed : 0, dt);
+      return;
     }
+    this.t += dt;
     // Speed ramp.
-    this.speed = Math.min(7.5, this.speed + 0.0025);
-    // Score + collision.
-    this.score++;
+    this.speed = Math.min(13, this.speed + 0.002 * dt);
+
+    // Score accumulates a bit faster than 1 per frame; matches a "feels
+    // right" rate for short generations.
+    this.scoreAccum += 0.5 * dt;
+    while (this.scoreAccum >= 1) {
+      this.scoreAccum -= 1;
+      this.score += 1;
+      // Achievement flash every 100 points.
+      if (this.score > 0 && this.score % 100 === 0) {
+        this.flashScore = 24;
+      }
+      // Day/night flip every 700 points.
+      if (this.score > 0 && this.score - this.lastMilestone >= 700) {
+        this.lastMilestone = this.score;
+        this.night = !this.night;
+        this.nightFlash = 60;
+        this.wrap.classList.toggle("night", this.night);
+      }
+    }
+    if (this.flashScore > 0) this.flashScore -= dt;
+    if (this.nightFlash > 0) this.nightFlash -= dt;
+
+    // Dino physics.
     const d = this.dino;
-    const dx0 = d.x, dx1 = d.x + d.size;
-    const dy0 = this.groundY - d.size + d.y, dy1 = this.groundY + d.y;
+    // Down-while-airborne accelerates fall (matches the "fast-drop" feel).
+    const grav = this.holdDown && !d.grounded ? 1.8 : 0.6;
+    d.vy += grav * dt;
+    d.y += d.vy * dt;
+    if (d.y >= 0) {
+      d.y = 0;
+      d.vy = 0;
+      d.grounded = true;
+      if (this.holdDown) d.ducking = true;
+    }
+    if (!d.grounded) d.ducking = false;
+    if (d.grounded) d.legPhase = (d.legPhase + 0.18 * dt) % 2;
+
+    // Move + cull obstacles.
+    for (const o of this.obstacles) o.x -= this.speed * dt;
+    this.obstacles = this.obstacles.filter(o => o.x + o.w > -20);
+
+    // Spawn obstacles. Spacing is speed-aware so the gap stays passable.
+    this.spawnTimer -= dt;
+    if (this.spawnTimer <= 0) {
+      this._spawnObstacle();
+      const baseGap = Math.max(58, 130 - this.speed * 4);
+      this.spawnTimer = baseGap + Math.random() * 60;
+    }
+
+    // Clouds (decorative).
+    for (const c of this.clouds) c.x -= this.speed * 0.18 * dt;
+    this.clouds = this.clouds.filter(c => c.x > -50);
+    if (this.clouds.length < 3 && Math.random() < 0.012 * dt) {
+      this.clouds.push({
+        x: this.w + 10,
+        y: 18 + Math.random() * (this.groundY * 0.45),
+        w: 36 + Math.random() * 18,
+      });
+    }
+
+    // Ground texture scroll.
+    this._scrollGround(this.speed, dt);
+
+    // Collisions.
+    const hit = this._dinoHitbox();
     for (const o of this.obstacles) {
-      const ox0 = o.x, ox1 = o.x + o.w;
-      const oy0 = this.groundY - o.h, oy1 = this.groundY;
-      if (dx1 > ox0 && dx0 < ox1 && dy1 > oy0 && dy0 < oy1) {
+      const box = this._obstacleHitbox(o);
+      if (this._rectsOverlap(hit, box)) {
         this.over = true;
-        this.best = Math.max(this.best, this.score);
+        if (this.score > this.best) {
+          this.best = this.score;
+          try { localStorage.setItem(_GAME_BEST_KEY, String(this.best)); } catch (_) {}
+        }
+        break;
       }
     }
   }
-  draw() {
-    const c = this.ctx;
-    c.clearRect(0, 0, this.w, this.h);
-    // Ground line.
-    c.strokeStyle = "rgba(77, 156, 255, 0.45)";
-    c.lineWidth = 1;
-    c.beginPath();
-    c.moveTo(0, this.groundY + 0.5);
-    c.lineTo(this.w, this.groundY + 0.5);
-    c.stroke();
-    // Dino (cyan glow rect).
-    const d = this.dino;
-    c.fillStyle = "#4d9cff";
-    c.shadowColor = "rgba(77,156,255,0.7)";
-    c.shadowBlur = 8;
-    c.fillRect(d.x, this.groundY - d.size + d.y, d.size, d.size);
-    // Little leg tick to feel animated when running.
-    if (d.grounded && this.started && !this.over) {
-      const phase = Math.floor(this.score / 5) % 2 === 0 ? 0 : 3;
-      c.fillRect(d.x + 3, this.groundY + d.y, 4, 3 + phase);
-      c.fillRect(d.x + d.size - 7, this.groundY + d.y, 4, 6 - phase);
-    }
-    // Obstacles (orange).
-    c.fillStyle = "#ff6b35";
-    c.shadowColor = "rgba(255,107,53,0.6)";
-    for (const o of this.obstacles) {
-      c.fillRect(o.x, this.groundY - o.h, o.w, o.h);
-    }
-    c.shadowBlur = 0;
-    // Score / state text.
-    c.font = "600 11px DM Sans, sans-serif";
-    c.fillStyle = "rgba(255,255,255,0.85)";
-    c.textAlign = "right";
-    c.fillText(`${String(this.score).padStart(4, "0")}  HI ${String(this.best).padStart(4, "0")}`, this.w - 8, 14);
-    if (!this.started) {
-      c.textAlign = "center";
-      c.fillStyle = "rgba(255,255,255,0.7)";
-      c.fillText("press SPACE to start", this.w / 2, this.h / 2);
-    } else if (this.over) {
-      c.textAlign = "center";
-      c.fillStyle = "#ff6b6b";
-      c.fillText("GAME OVER  ·  R to restart", this.w / 2, this.h / 2);
+
+  _scrollGround(speed, dt) {
+    for (const g of this.ground) g.x -= speed * dt;
+    this.ground = this.ground.filter(g => g.x > -5);
+    while (this.ground.length === 0 || this.ground[this.ground.length - 1].x < this.w + 20) {
+      const last = this.ground[this.ground.length - 1];
+      const nextX = (last ? last.x : 0) + 3 + Math.random() * 9;
+      this.ground.push({ x: nextX, h: Math.random() < 0.3 ? 2 : 1 });
     }
   }
+
+  _spawnObstacle() {
+    // Pterodactyls (birds) unlock after the run gets going.
+    const canBird = this.score >= 250;
+    const isBird = canBird && Math.random() < 0.18;
+    if (isBird) {
+      // Three flight heights: low, mid, high.
+      const level = Math.floor(Math.random() * 3);
+      const heights = [
+        this.groundY - 14,      // low — duck under
+        this.groundY - 32,      // mid — jump over or duck under
+        this.groundY - 50,      // high — run beneath
+      ];
+      this.obstacles.push({
+        kind: "bird",
+        x: this.w + 24,
+        y: heights[level],
+        w: 38, h: 22,
+        wing: 0,
+      });
+      return;
+    }
+    // Cactus group: 1-3 cacti, mixed small / large widths.
+    const groupSize = 1 + Math.floor(Math.random() * 3);
+    const big = Math.random() < 0.45;
+    const unitW = big ? 22 : 14;
+    const unitH = big ? 44 : 30;
+    let x = this.w + 12;
+    for (let i = 0; i < groupSize; i++) {
+      this.obstacles.push({
+        kind: "cactus",
+        x,
+        y: this.groundY - unitH,
+        w: unitW,
+        h: unitH,
+        big,
+      });
+      x += unitW + 1;
+    }
+  }
+
+  _dinoHitbox() {
+    const d = this.dino;
+    const top = this.groundY + d.y - (d.ducking ? 22 : 42);
+    const w = d.ducking ? 52 : 38;
+    const h = d.ducking ? 22 : 42;
+    return { x: d.x + 4, y: top + 4, w: w - 8, h: h - 8 };
+  }
+  _obstacleHitbox(o) {
+    // Tighter than the draw rect so the player gets a little forgiveness.
+    return { x: o.x + 3, y: o.y + 3, w: o.w - 6, h: o.h - 6 };
+  }
+  _rectsOverlap(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  // --- Drawing ----------------------------------------------------------
+
+  _draw() {
+    const c = this.ctx;
+    const bg = this.night ? _GAME_GRAY : _GAME_LIGHT;
+    const fg = this.night ? _GAME_LIGHT : _GAME_GRAY;
+    c.fillStyle = bg;
+    c.fillRect(0, 0, this.w, this.h);
+
+    // Clouds.
+    c.fillStyle = fg;
+    for (const cl of this.clouds) this._drawCloud(cl, fg);
+
+    // Ground line.
+    c.fillStyle = fg;
+    c.fillRect(0, this.groundY, this.w, 1);
+    for (const g of this.ground) c.fillRect(g.x, this.groundY + 2, 2, g.h);
+
+    // Obstacles.
+    for (const o of this.obstacles) {
+      if (o.kind === "cactus") this._drawCactus(o, fg);
+      else if (o.kind === "bird") this._drawBird(o, fg);
+    }
+
+    // Dino.
+    this._drawDino(fg);
+
+    // Score / best.
+    c.fillStyle = fg;
+    c.font = "600 13px ui-monospace, 'DM Sans', sans-serif";
+    c.textAlign = "right";
+    const scoreStr = String(this.score).padStart(5, "0");
+    const blink = (this.flashScore > 0) && (Math.floor(this.flashScore / 6) % 2 === 0);
+    const renderScore = blink ? "" : scoreStr;
+    const bestStr = this.best > 0 ? `HI ${String(this.best).padStart(5, "0")}  ` : "";
+    c.fillText(`${bestStr}${renderScore}`, this.w - 16, 22);
+
+    // Game over banner.
+    if (this.over) this._drawGameOver(fg);
+    else if (!this.started) this._drawStartHint(fg);
+  }
+
+  _drawCloud(cl, fg) {
+    // Lozenge made of overlapping rects — gives a pixel-art cloud feel.
+    const c = this.ctx, x = cl.x, y = cl.y, w = cl.w;
+    c.fillStyle = fg;
+    c.fillRect(x + w * 0.20, y + 0, w * 0.60, 3);
+    c.fillRect(x + w * 0.10, y + 3, w * 0.80, 3);
+    c.fillRect(x + 0,        y + 6, w,         3);
+    c.fillRect(x + w * 0.10, y + 9, w * 0.80, 3);
+    c.fillRect(x + w * 0.30, y + 12, w * 0.40, 3);
+  }
+
+  _drawCactus(o, fg) {
+    const c = this.ctx;
+    c.fillStyle = fg;
+    // Central trunk.
+    c.fillRect(o.x + Math.floor(o.w * 0.35), o.y, Math.floor(o.w * 0.30), o.h);
+    // Side arms — short stubs offset upward.
+    const armW = Math.max(3, Math.floor(o.w * 0.22));
+    const armH = Math.floor(o.h * 0.45);
+    c.fillRect(o.x, o.y + Math.floor(o.h * 0.30), armW, armH);
+    c.fillRect(o.x + o.w - armW, o.y + Math.floor(o.h * 0.18), armW, armH);
+    // Arm caps connecting back to trunk.
+    c.fillRect(o.x + armW, o.y + Math.floor(o.h * 0.30), Math.floor(o.w * 0.15), 4);
+    c.fillRect(o.x + o.w - armW - Math.floor(o.w * 0.15), o.y + Math.floor(o.h * 0.18), Math.floor(o.w * 0.15), 4);
+  }
+
+  _drawBird(o, fg) {
+    const c = this.ctx;
+    c.fillStyle = fg;
+    // Flap toggles between two poses based on time.
+    o.wing = (o.wing + 0.08) % 2;
+    const wingsUp = o.wing < 1;
+    // Body.
+    c.fillRect(o.x + 12, o.y + 8, 18, 6);
+    // Head + beak.
+    c.fillRect(o.x + 28, o.y + 6, 6, 4);
+    c.fillRect(o.x + 34, o.y + 8, 4, 2);
+    // Eye dot.
+    c.fillStyle = this.night ? _GAME_GRAY : _GAME_LIGHT;
+    c.fillRect(o.x + 30, o.y + 7, 1, 1);
+    c.fillStyle = fg;
+    // Wings.
+    if (wingsUp) {
+      c.fillRect(o.x + 14, o.y, 14, 5);
+      c.fillRect(o.x + 18, o.y - 4, 8, 4);
+    } else {
+      c.fillRect(o.x + 14, o.y + 14, 14, 5);
+      c.fillRect(o.x + 18, o.y + 18, 8, 4);
+    }
+    // Tail.
+    c.fillRect(o.x + 6, o.y + 9, 6, 4);
+  }
+
+  _drawDino(fg) {
+    const c = this.ctx;
+    c.fillStyle = fg;
+    const d = this.dino;
+    const baseX = d.x;
+    const baseY = this.groundY + d.y;
+
+    if (d.ducking && d.grounded) {
+      // Ducking pose: lower, longer.
+      // Body
+      c.fillRect(baseX, baseY - 16, 38, 12);
+      // Head
+      c.fillRect(baseX + 30, baseY - 22, 22, 16);
+      // Eye (inverted color)
+      c.fillStyle = this.night ? _GAME_GRAY : _GAME_LIGHT;
+      c.fillRect(baseX + 46, baseY - 18, 2, 2);
+      c.fillStyle = fg;
+      // Tail bump
+      c.fillRect(baseX - 4, baseY - 12, 8, 6);
+      // Legs alternating
+      const stepA = d.legPhase < 1;
+      c.fillRect(baseX + 6,  baseY - 4, 6, stepA ? 4 : 2);
+      c.fillRect(baseX + 22, baseY - 4, 6, stepA ? 2 : 4);
+      return;
+    }
+
+    // Standing / running / jumping pose.
+    // Head
+    c.fillRect(baseX + 18, baseY - 42, 22, 18);
+    // Eye (inverted)
+    c.fillStyle = this.night ? _GAME_GRAY : _GAME_LIGHT;
+    c.fillRect(baseX + 34, baseY - 36, 2, 2);
+    c.fillStyle = fg;
+    // Mouth slot
+    c.fillRect(baseX + 32, baseY - 28, 6, 1);
+    // Neck (smaller block under head)
+    c.fillRect(baseX + 18, baseY - 26, 8, 6);
+    // Body
+    c.fillRect(baseX + 4, baseY - 24, 24, 18);
+    // Tail nub
+    c.fillRect(baseX - 4, baseY - 22, 8, 8);
+    // Front arm
+    c.fillRect(baseX + 22, baseY - 12, 4, 4);
+
+    if (this.over) {
+      // X eye for game over.
+      c.fillStyle = this.night ? _GAME_GRAY : _GAME_LIGHT;
+      c.fillRect(baseX + 34, baseY - 36, 4, 1);
+      c.fillStyle = fg;
+      c.fillRect(baseX + 34, baseY - 37, 1, 3);
+      c.fillRect(baseX + 36, baseY - 37, 1, 3);
+    }
+
+    if (!d.grounded) {
+      // Airborne — both legs together, slightly tucked.
+      c.fillRect(baseX + 6,  baseY - 6, 7, 6);
+      c.fillRect(baseX + 16, baseY - 6, 7, 6);
+    } else {
+      // Run cycle: alternate which leg is forward + extended.
+      const stepA = d.legPhase < 1;
+      if (this.over || !this.started) {
+        // Standing still: both legs down.
+        c.fillRect(baseX + 4,  baseY - 6, 7, 6);
+        c.fillRect(baseX + 16, baseY - 6, 7, 6);
+      } else if (stepA) {
+        c.fillRect(baseX + 4,  baseY - 6, 7, 6);
+        c.fillRect(baseX + 16, baseY - 3, 7, 3);
+      } else {
+        c.fillRect(baseX + 4,  baseY - 3, 7, 3);
+        c.fillRect(baseX + 16, baseY - 6, 7, 6);
+      }
+    }
+  }
+
+  _drawStartHint(fg) {
+    const c = this.ctx;
+    c.fillStyle = fg;
+    c.globalAlpha = 0.7;
+    c.font = "600 12px 'DM Sans', sans-serif";
+    c.textAlign = "center";
+    c.fillText("Press SPACE to play", this.w / 2, this.h / 2);
+    c.globalAlpha = 1;
+  }
+
+  _drawGameOver(fg) {
+    const c = this.ctx;
+    c.fillStyle = fg;
+    c.font = "700 18px 'DM Sans', sans-serif";
+    c.textAlign = "center";
+    c.fillText("G A M E   O V E R", this.w / 2, this.h * 0.36);
+
+    // Restart icon: a circular arrow drawn with arc + arrowhead.
+    const cx = this.w / 2, cy = this.h * 0.36 + 28, r = 11;
+    c.strokeStyle = fg;
+    c.lineWidth = 2;
+    c.beginPath();
+    c.arc(cx, cy, r, Math.PI * 0.15, Math.PI * 1.85);
+    c.stroke();
+    // Arrowhead at the open end.
+    const ah = 5;
+    c.beginPath();
+    c.moveTo(cx + r - 1, cy + 2);
+    c.lineTo(cx + r + ah, cy + 2);
+    c.lineTo(cx + r + 2, cy + ah + 2);
+    c.closePath();
+    c.fill();
+
+    c.font = "500 11px 'DM Sans', sans-serif";
+    c.globalAlpha = 0.7;
+    c.fillText("press SPACE / R / click to restart", this.w / 2, cy + 28);
+    c.globalAlpha = 1;
+  }
+
   destroy() {
     this.alive = false;
     if (this.raf) cancelAnimationFrame(this.raf);
-    this.canvas.removeEventListener("keydown", this.onKey);
-    this.canvas.removeEventListener("pointerdown", this.onPointer);
+    document.removeEventListener("keydown", this._onKey);
+    document.removeEventListener("keyup", this._onKeyUp);
+    this.wrap.removeEventListener("pointerdown", this._onPointer);
+    window.removeEventListener("resize", this._onResize);
+    this.wrap.classList.remove("night");
   }
 }
 
@@ -1342,12 +1727,12 @@ class DinoGame {
 let _activeDinoGame = null;
 function bootDinoIfPresent() {
   if (_activeDinoGame) { _activeDinoGame.destroy(); _activeDinoGame = null; }
-  const canvas = preview?.querySelector(".dino-canvas");
-  if (canvas) {
+  const wrap = preview?.querySelector(".gen-game");
+  if (wrap) {
     // RAF defer so the canvas has its final layout size before we read it.
     requestAnimationFrame(() => {
-      if (!preview.contains(canvas)) return;
-      _activeDinoGame = new DinoGame(canvas);
+      if (!preview.contains(wrap)) return;
+      _activeDinoGame = new DinoGame(wrap);
     });
   }
 }
