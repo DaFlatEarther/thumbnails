@@ -423,6 +423,32 @@ RULE 4 — STRUCTURAL ELEMENTS THE REFERENCE USES MUST BE PRESERVED:
   • Visual devices — arrows, circles, strikethroughs, price tags, badges. If the reference has a red curved arrow, the output has a red curved arrow. If the reference has a price tag in the corner, the output has a price tag in the corner. Adapt the CONTENT of the device (e.g. price value swaps to fit the new title's tone), not its presence.
   • Background type and lighting style — same kind of background (e.g. luxury boutique blurred → keep as a relevant blurred high-end backdrop), same lighting style (warm boutique = warm boutique, dark dramatic = dark dramatic).
 
+RULE 5 — SUBJECT SPECIFICITY MUST MATCH THE TITLE. NAME REAL PEOPLE AND BRANDS WHEN APPROPRIATE.
+The level of specificity in your output prompt must match what the user's title implies:
+
+  • If the user's title names CATEGORIES of recognizable entities ("celebrities", "wealthy CEOs", "famous athletes", "luxury watches", "supercars", "world leaders") then the output must feature SPECIFIC, RECOGNIZABLE instances of that category — not generic stand-ins. NEVER write "a celebrity-looking person", "a person who could be a celebrity", or "a famous-looking face" — those phrases tell the image model nothing useful.
+
+  • NAMING REAL PEOPLE IS ALLOWED AND ENCOURAGED for adult public figures. The downstream image generator can render recognizable adult celebrities, athletes, business figures, etc. If you can identify a specific public figure in the reference image (or one would clearly fit the user's title), name them directly in the prompt. For example: "Tom Cruise standing on the left of the frame with an expression of wide-eyed shock, facing his identical clone on the right" is FAR better than "a Hollywood actor with dark hair...". Concrete names ground the model. Use the reference image to identify who's there — Gemini Vision can recognize public figures. (If a specific name happens to get refused by the image model's content filter, the render gracefully falls back to a similar archetype — naming is still worth attempting first.)
+
+  • If you genuinely can't or shouldn't name a specific person (e.g. unclear identity in the reference, or the user wants a generic archetype), fall back to detailed physical description: build, age range, hair color and style, complexion, distinguishing facial features, signature clothing/style — concrete enough that the model has something to render.
+
+  • Same rule for non-person subjects. If the user's title is about a category of branded products ("Rolex Submariner", "Tesla Cybertruck", "Apple Watch Ultra"), use the BRAND/MODEL NAMES directly in the prompt. The image gen knows what these look like.
+
+  • The "swap the subject content" rule from Step 2 applies to GENERIC vs THE-REFERENCE-IS-DIFFERENT cases — if the user's subject is a different kind of thing from the reference's subject, swap. If the subject KIND is the same and the title is about that kind, keep the same level of specificity (named people, named products).
+
+RULE 6 — SWAP THE IDENTITY WHEN THE REFERENCE'S SUBJECT IS BOUND TO ITS OWN TITLE.
+This is the most common failure mode. If the reference image shows a SPECIFIC identifiable person, object, brand, or product whose identity is tied to the REFERENCE'S OWN TITLE (the founder of the reference's company, the product of the reference's brand, the politician of the reference's country, the celebrity of the reference's video), AND the user's NEW TITLE is about a DIFFERENT specific entity, you MUST replace the identity with the appropriate equivalent for the user's title — DO NOT reuse the reference's specific subject.
+
+Examples:
+  • Reference shows "The Story of Hilti" with the Hilti founder + a Hilti tool + the Hilti logo. User's title is "The Story of Ryobi". → Output describes the Ryobi founder (Yutaka Urakami, elderly Japanese man), a recognizable Ryobi power tool (lime green and black impact driver / drill), and the Ryobi logo. The face, the tool, and the brand all swap. Do NOT keep the Hilti founder's face.
+  • Reference shows "How Beyoncé Stole the Spotlight" with Beyoncé centered. User's title is about Taylor Swift. → Output describes Taylor Swift, not Beyoncé.
+  • Reference shows "The Last Pope's Final Days" with Pope Francis. User's title is about a 1500s pope. → Output describes a Renaissance-era pope (named where possible), not Pope Francis.
+  • Reference shows a Rolex Submariner in a "watch tier list". User's title is "Patek Philippe tier list". → Output describes Patek Philippe watches (Nautilus, Calatrava, etc.), not the Submariner.
+
+The STRUCTURAL ROLE transfers (founder portrait + product + logo + warm beige bg + warm soft lighting + painterly aesthetic). The IDENTITY at the structural role's location swaps to fit the user's title.
+
+When you describe the swapped identity, BE EXPLICIT in concrete prose: "[user's brand]'s founder, an elderly [appropriate nationality/ethnicity] man in his 70s with [specific identifying features distinct from the reference's person]" — that way the image generator gets a counter-signal strong enough to overcome the reference's visual bleed. Vague phrases like "an older man" will let the reference image's identity bleed through; specific physical descriptors push the generator away from copying.
+
 ═══════════════════════════════════════════════════════════════════════════
 
 Do these steps internally — do NOT show your reasoning in the output:
@@ -632,6 +658,7 @@ def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
             "thumbnail_url": v.get("thumbnail_url"),
             "outlier_score": v.get("outlier_score"),
             "channel_name": v.get("channel_name") or "",
+            "channel_thumbnail": v.get("channel_thumbnail"),
             "view_count": v.get("view_count"),
             "url": v.get("url") or (
                 f"https://www.youtube.com/watch?v={v.get('video_id')}"
@@ -1269,6 +1296,37 @@ def _build_mcp() -> FastMCP:
                 payload["error"] = error
             return json.dumps(payload, default=str)
 
+    # ----- Back-compat alias: generate_thumbnail_from_video ---------------
+    # The clean tool is `extract_reference_from_video(url, user_title=X)`
+    # — passing user_title triggers the auto-pipeline. But cached connector
+    # tool lists in claude.ai may still reference the old name. This alias
+    # forwards to the new behavior so stale caches don't break with
+    # "Unknown tool" errors. Safe to remove once all connectors are re-synced.
+    @mcp.tool(
+        name="generate_thumbnail_from_video",
+        title="(Alias) Generate Thumbnail From Reference Video",
+        description=(
+            "DEPRECATED ALIAS — prefer extract_reference_from_video with "
+            "user_title set. Forwards to the same auto-pipeline (extract → "
+            "compose → generate, mounted in the widget with stage-by-stage "
+            "loading indicators). Kept for back-compat with cached "
+            "connector tool lists."
+        ),
+        meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
+    )
+    async def generate_thumbnail_from_video_alias(
+        user_title: Annotated[str, "The user's NEW video title — what THEIR thumbnail is for."],
+        reference_video_url: Annotated[str, "YouTube URL of the reference video the user wants to base the design on."],
+        style_preset: Annotated[str, "person_focal | faceless | none. Default 'none'."] = "none",
+        aspect_ratio: Annotated[str, "16:9 / 9:16 / etc. Default 16:9."] = "16:9",
+        resolution: Annotated[str, "1K / 2K / 4K. Default 2K."] = "2K",
+    ) -> str:
+        # Forward directly to the canonical tool's behavior.
+        return await extract_reference_from_video_tool(
+            url_or_id=reference_video_url,
+            user_title=user_title,
+        )
+
     # ----- Reference by direct YouTube URL --------------------------------
     # Lets the user (via chat or widget paste) say "make a thumbnail like
     # THIS video" by handing over a YouTube URL/ID. Server pulls the
@@ -1279,19 +1337,18 @@ def _build_mcp() -> FastMCP:
         name="extract_reference_from_video",
         title="Use a Specific YouTube Video as the Reference",
         description=(
-            "When the user wants to base a thumbnail on a SPECIFIC video "
-            "they've linked (instead of browsing outliers), call this. "
-            "It pulls the video's title + best-quality thumbnail via "
-            "youtubei.js and mounts the same thumbnail-studio widget as "
-            "find_outlier_references, but with a single pre-selected card. "
-            "The user then clicks 'Create Prompt' and 'Generate' inside the "
-            "widget — same downstream pipeline.\n\n"
-            "Pass `user_title` whenever the user has told you their video "
-            "title; the widget pre-fills its title field with it so they "
-            "don't retype.\n\n"
-            "After calling this, STOP — the widget handles compose and "
-            "generate. Do NOT also call compose_thumbnail_prompt or "
-            "generate_thumbnail in the same turn."
+            "Use this when the user wants to base a thumbnail on a SPECIFIC "
+            "YouTube video they've linked. Pulls the video's title + best-"
+            "quality thumbnail via youtubei.js and mounts the widget.\n\n"
+            "BEHAVIOR DEPENDS ON `user_title`:\n"
+            "  • If you pass `user_title` (you have the user's video title): "
+            "the widget auto-runs the FULL pipeline — compose the engineered "
+            "prompt, then generate the image. The user sees stage-by-stage "
+            "progress and the finished thumbnail appears in ~45-65s.\n"
+            "  • If you don't pass `user_title` (user only shared a video, "
+            "no specific title yet): the widget mounts with the reference "
+            "preselected. The user clicks Create Prompt → Generate manually.\n\n"
+            "ALWAYS pass `user_title` when you have it. After calling, STOP."
         ),
         meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
     )
@@ -1324,6 +1381,7 @@ def _build_mcp() -> FastMCP:
             "title": info.get("title") or "",
             "thumbnail_url": info.get("thumbnail_url"),
             "channel_name": info.get("channel_name") or "",
+            "channel_thumbnail": info.get("channel_thumbnail"),
             "view_count": info.get("view_count"),
             "outlier_score": None,
             "url": f"https://www.youtube.com/watch?v={info.get('video_id')}" if info.get("video_id") else None,
@@ -1338,6 +1396,11 @@ def _build_mcp() -> FastMCP:
         }
         if user_title:
             payload["title"] = user_title
+            # User provided BOTH a title and a reference video → fire the
+            # full pipeline automatically. Widget will chain compose +
+            # generate via callServerTool with stage-by-stage loading
+            # indicators (no single 60s blank wait).
+            payload["auto_pipeline"] = True
         return json.dumps(payload, default=str)
 
     # ----- Claude-as-editor: refine the existing engineered prompt --------

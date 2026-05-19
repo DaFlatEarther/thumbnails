@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8" />
-<meta name="color-scheme" content="light dark" />
+<meta name="color-scheme" content="dark" />
 <!-- Preconnect to Kie's image CDN so the first thumbnail loads fast once it
      arrives. (The CSP allowlist on the resource declares the same origins.) -->
 <link rel="preconnect" href="https://tempfile.aiquickdraw.com" crossorigin />
@@ -10,183 +10,550 @@
 <link rel="preconnect" href="https://cdn.kie.ai" crossorigin />
 <link rel="preconnect" href="https://i.ytimg.com" crossorigin />
 <link rel="preconnect" href="https://audio.algrow.online" crossorigin />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" />
 <style>
+  /* Match the algrow.online viral discovery card aesthetic — dark surface,
+     rounded thumbnails, gradient outlier pills, channel pill at the bottom.
+     We stay dark in both Claude themes on purpose; it reads as a
+     "video card embed". */
   :root {
-    --ink:   var(--color-text-primary,   #0f1111);
-    --sub:   var(--color-text-secondary, #5a6270);
-    --line:  var(--color-border-default, #e3e6ea);
-    --card:  var(--color-surface-secondary, #f6f7f9);
-    --accent:var(--color-accent, #2a6df4);
-    --bad:   var(--color-text-error, #b54040);
-    --field: var(--color-surface-primary, #fff);
-  }
-  :root.dark {
-    --ink:   var(--color-text-primary,   #f1f3f5);
-    --sub:   var(--color-text-secondary, #a8b0bc);
-    --line:  var(--color-border-default, #2a2f38);
-    --card:  var(--color-surface-secondary, #1a1d22);
-    --accent:var(--color-accent, #87aaff);
-    --field: var(--color-surface-primary, #0f1216);
+    --ink:       #ffffff;
+    --sub:       rgba(255, 255, 255, 0.7);
+    --line:      rgba(255, 255, 255, 0.1);
+    --line-hi:   rgba(255, 255, 255, 0.3);
+    --card-bg:   rgba(30, 30, 30, 0.55);
+    --card-hi:   rgba(45, 45, 45, 0.75);
+    --thumb-bg:  #1a1a1a;
+    --accent:    #4d9cff;
+    --accent-hi: #6fb1ff;
+    --bad:       #ff6b6b;
+    --outlier-a: #ff6b35;
+    --outlier-b: #ff8e00;
+    --avatar-bg: rgba(255, 255, 255, 0.12);
+    --field:     rgba(20, 20, 20, 0.6);
   }
   html, body { background: transparent; color: var(--ink); margin: 0; }
-  body { font: 14px/1.4 -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto, sans-serif; }
-  .wrap { display: flex; flex-direction: column; gap: 10px; padding: 4px; }
+  body {
+    font-size: 13px;
+    line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Hide the host iframe's scrollbar — Claude caps the iframe at a max
+     height even with autoResize, and the overflow shows a scrollbar inside
+     the widget that looks ugly against the dark cards. Wheel/touch still
+     scroll. */
+  html, body { scrollbar-width: none; -ms-overflow-style: none; }
+  html::-webkit-scrollbar, body::-webkit-scrollbar { width: 0; height: 0; display: none; }
+  /* Force DM Sans everywhere. Host iframe styles (Claude) and the browser
+     UA stylesheet both reset font-family on form controls, so we apply
+     !important on a broad selector list. The system stack is the fallback
+     for when the Google Fonts CSS hasn't loaded yet or is blocked by CSP. */
+  html, body, button, input, select, textarea,
+  h1, h2, h3, h4, h5, h6, p, span, div, a, li, label {
+    font-family: "DM Sans", -apple-system, BlinkMacSystemFont, system-ui,
+                 "Segoe UI", Roboto, sans-serif !important;
+  }
+  * { font-family: inherit; }
+  /* Bottom padding gives the iframe extra height so the style-preset
+     dropdown (last in the row) doesn't clip when opened downward —
+     position:absolute popups don't expand the parent on their own. */
+  .wrap { display: flex; flex-direction: column; gap: 14px; padding: 4px 4px 180px; }
+
   .preview {
     width: 100%;
     aspect-ratio: 16 / 9;
-    border-radius: 10px;
+    border-radius: 16px;
     border: 1px solid var(--line);
-    background: var(--card);
+    background: var(--card-bg);
     overflow: hidden;
     position: relative;
     display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    transition: border-color .25s ease, box-shadow .25s ease;
   }
-  .preview img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
+  .preview:hover { border-color: var(--line-hi); }
+  .preview img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+    cursor: zoom-in;
+    transition: transform .3s ease;
+  }
+  .preview:hover img { transform: scale(1.02); }
   .preview .empty, .preview .err {
-    color: var(--sub); font-size: 13px; padding: 16px; text-align: center;
+    color: var(--sub); font-size: 13px; padding: 20px; text-align: center;
+    line-height: 1.5;
   }
+  .preview .empty b { color: var(--ink); font-weight: 600; }
   .preview .err { color: var(--bad); }
   .preview .spinner {
-    width: 28px; height: 28px;
+    width: 32px; height: 32px;
     border: 3px solid var(--line);
     border-top-color: var(--accent);
     border-radius: 50%;
     animation: spin 0.9s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Thematic loader — direct port of algrow's scraper "Data Harvest"
+     animation. Pulsing central icon, three concentric ripples emanating
+     outward, eight particles flying inward from the perimeter, indeterminate
+     stripe bar. The metaphor: a beacon pulling visual ideas in from the
+     void. Pure CSS, no JS animation loop. */
+  .gen-loader {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 24px;
+    padding: 20px;
+    overflow: hidden;
+    background: linear-gradient(135deg, #0a0a0c, #14141a);
+  }
+  .gen-loader::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(77,156,255,0.5), transparent);
+  }
+  .gen-loader-stage {
+    position: relative;
+    width: 140px; height: 140px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .gen-loader-icon {
+    position: relative;
+    z-index: 10;
+    width: 80px; height: 80px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.5);
+    border: 1px solid rgba(77,156,255,0.3);
+    backdrop-filter: blur(5px);
+    -webkit-backdrop-filter: blur(5px);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--accent);
+    filter: drop-shadow(0 0 20px rgba(77,156,255,0.5));
+    animation: gen-pulse 2s ease-in-out infinite;
+  }
+  .gen-loader-icon svg { width: 34px; height: 34px; }
+  @keyframes gen-pulse {
+    0%, 100% { transform: scale(1); box-shadow: 0 0 20px rgba(77,156,255,0.2); border-color: rgba(77,156,255,0.3); }
+    50%      { transform: scale(1.05); box-shadow: 0 0 40px rgba(77,156,255,0.4); border-color: rgba(77,156,255,0.6); }
+  }
+  .gen-loader-ripple {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 40%; height: 40%;
+    border: 1px solid var(--accent);
+    border-radius: 50%;
+    opacity: 0;
+    box-shadow: 0 0 15px rgba(77,156,255,0.3);
+  }
+  .gen-loader-ripple.r1 { animation: gen-ripple 3s linear infinite 0s; }
+  .gen-loader-ripple.r2 { animation: gen-ripple 3s linear infinite 1s; }
+  .gen-loader-ripple.r3 { animation: gen-ripple 3s linear infinite 2s; }
+  @keyframes gen-ripple {
+    0%   { width: 40%; height: 40%; opacity: 0; border-width: 2px; }
+    30%  { opacity: 1; }
+    100% { width: 140%; height: 140%; opacity: 0; border-width: 0; }
+  }
+  .gen-loader-particle {
+    position: absolute;
+    width: 8px; height: 8px;
+    background: #60a5fa;
+    border-radius: 2px;
+    opacity: 0;
+    box-shadow: 0 0 8px #60a5fa;
+  }
+  .gen-loader-particle.p1 { top: 0;    left: 50%;  animation: gen-particle 2s ease-in infinite 0s; }
+  .gen-loader-particle.p2 { top: 50%;  left: 100%; animation: gen-particle 2s ease-in infinite 0.5s; }
+  .gen-loader-particle.p3 { top: 100%; left: 50%;  animation: gen-particle 2s ease-in infinite 1s; }
+  .gen-loader-particle.p4 { top: 50%;  left: 0;    animation: gen-particle 2s ease-in infinite 1.5s; }
+  .gen-loader-particle.p5 { top: 15%;  left: 15%;  animation: gen-particle 2s ease-in infinite 0.25s; }
+  .gen-loader-particle.p6 { top: 15%;  left: 85%;  animation: gen-particle 2s ease-in infinite 0.75s; }
+  .gen-loader-particle.p7 { top: 85%;  left: 85%;  animation: gen-particle 2s ease-in infinite 1.25s; }
+  .gen-loader-particle.p8 { top: 85%;  left: 15%;  animation: gen-particle 2s ease-in infinite 1.75s; }
+  @keyframes gen-particle {
+    0%   { opacity: 0; transform: scale(0); }
+    20%  { opacity: 1; transform: scale(1); }
+    100% { top: 50%; left: 50%; opacity: 0; transform: scale(0.5); }
+  }
+  .gen-loader-inner {
+    display: flex; flex-direction: column;
+    align-items: center; gap: 10px;
+    max-width: 340px;
+    width: 100%;
+    text-align: center;
+    z-index: 2;
+  }
+  .gen-loader-label {
+    color: #fff;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .gen-loader-sub {
+    color: rgba(255,255,255,0.65);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .gen-loader-bar {
+    width: 100%;
+    max-width: 280px;
+    height: 6px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 10px;
+    overflow: hidden;
+    position: relative;
+    margin-top: 6px;
+  }
+  .gen-loader-bar-fill {
+    position: absolute;
+    top: 0; bottom: 0;
+    width: 35%;
+    background: linear-gradient(90deg, var(--accent), #2f7fdc);
+    border-radius: 10px;
+    animation: gen-bar-slide 1.8s ease-in-out infinite;
+  }
+  .gen-loader-bar-fill::after {
+    content: '';
+    position: absolute; inset: 0;
+    background-image: linear-gradient(45deg,
+      rgba(255,255,255,0.2) 25%, transparent 25%,
+      transparent 50%, rgba(255,255,255,0.2) 50%,
+      rgba(255,255,255,0.2) 75%, transparent 75%);
+    background-size: 30px 30px;
+    animation: gen-stripes 1s linear infinite;
+  }
+  @keyframes gen-bar-slide {
+    0%   { left: -35%; }
+    100% { left: 100%; }
+  }
+  @keyframes gen-stripes {
+    from { background-position: 0 0; }
+    to   { background-position: 30px 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .gen-loader-icon, .gen-loader-ripple, .gen-loader-particle,
+    .gen-loader-bar-fill, .gen-loader-bar-fill::after { animation: none; }
+  }
+
   .meta {
     display: flex; gap: 10px; font-size: 12px; color: var(--sub);
     align-items: center; flex-wrap: wrap;
+    padding: 0 2px;
   }
-  .meta a { color: var(--accent); text-decoration: none; }
-  .meta a:hover { text-decoration: underline; }
-  textarea {
+  .meta a { color: var(--accent); text-decoration: none; font-weight: 500; }
+  .meta a:hover { color: var(--accent-hi); text-decoration: underline; }
+
+  textarea, input[type="text"] {
     width: 100%;
     box-sizing: border-box;
-    min-height: 64px;
-    max-height: 160px;
-    padding: 9px 11px;
-    border-radius: 8px;
+    padding: 10px 13px;
+    border-radius: 10px;
     border: 1px solid var(--line);
     background: var(--field);
     color: var(--ink);
-    font: inherit;
+    font-size: 13px;
+    line-height: 1.4;
     resize: vertical;
+    transition: border-color .15s ease, background-color .15s ease;
   }
-  textarea:focus { outline: none; border-color: var(--accent); }
-  .row { display: flex; gap: 8px; align-items: center; }
-  select, button {
-    padding: 7px 11px;
-    border-radius: 8px;
+  textarea { min-height: 110px; max-height: 280px; }
+  textarea::placeholder, input::placeholder { color: rgba(255,255,255,0.4); }
+  textarea:focus, input:focus { outline: none; border-color: var(--accent); background: rgba(20,20,20,0.85); }
+
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+  /* Buttons keep the glass-card field background. */
+  button {
+    padding: 8px 13px;
+    border-radius: 10px;
     border: 1px solid var(--line);
     background: var(--field);
     color: var(--ink);
-    font: inherit;
+    font-size: 12.5px;
+    font-weight: 500;
     cursor: pointer;
+    transition: background-color .15s ease, border-color .15s ease, transform .1s ease;
   }
+  button:hover { border-color: var(--line-hi); background: rgba(45,45,45,0.7); }
+
+  /* Custom dropdown — ported from algrow's "Quick Filters" pattern. Native
+     <select> popups can't be styled and look bad against the dark card, so
+     each control is a button + a floating menu of items. A hidden <input>
+     under the same id preserves .value access for the rest of the JS. */
+  .dropdown-wrapper {
+    position: relative;
+    display: inline-block;
+  }
+  .dropdown-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    padding: 9px 14px;
+    border-radius: 10px;
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color .15s ease, border-color .15s ease;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-width: 140px;
+  }
+  .dropdown-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.25);
+  }
+  .dropdown-btn.active {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: var(--accent);
+  }
+  .dropdown-caret {
+    width: 14px; height: 14px;
+    color: var(--sub);
+    transition: transform .2s ease, color .2s ease;
+    flex-shrink: 0;
+  }
+  .dropdown-btn.active .dropdown-caret {
+    transform: rotate(180deg);
+    color: var(--accent);
+  }
+  .dropdown-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    background: rgba(26, 26, 26, 0.95);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 12px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    min-width: 100%;
+    z-index: 1000;
+    display: none;
+    overflow: hidden;
+    padding: 6px;
+  }
+  .dropdown-menu.show {
+    display: block;
+    animation: dropdown-pop .18s ease;
+  }
+  @keyframes dropdown-pop {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .dropdown-item {
+    padding: 9px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    color: var(--ink);
+    font-size: 12.5px;
+    transition: background-color .12s ease, color .12s ease;
+    white-space: nowrap;
+  }
+  .dropdown-item:hover { background: rgba(255, 255, 255, 0.08); }
+  .dropdown-item.active {
+    background: rgba(77, 156, 255, 0.15);
+    color: var(--accent);
+  }
+
   button.primary {
-    background: var(--accent); color: white; border-color: var(--accent);
-    font-weight: 600; padding: 7px 16px;
+    background: linear-gradient(135deg, var(--accent), #2f7fdc);
+    color: #fff;
+    border-color: transparent;
+    font-weight: 600;
+    padding: 9px 20px;
+    box-shadow: 0 4px 12px rgba(77, 156, 255, 0.3);
   }
-  button.primary:disabled { opacity: 0.55; cursor: progress; }
-  .hint { color: var(--sub); font-size: 12px; }
+  button.primary:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(77, 156, 255, 0.4); }
+  button.primary:disabled { opacity: 0.55; cursor: progress; transform: none; box-shadow: none; }
+
+  .hint { color: var(--sub); font-size: 11.5px; }
+
   .ref-toggle {
     color: var(--accent);
     background: transparent;
     border: none;
     padding: 0;
-    font: inherit;
+    font-size: 12.5px;
+    font-weight: 500;
     cursor: pointer;
     text-align: left;
   }
-  .ref-toggle:hover { text-decoration: underline; }
-  .ref-box {
-    border: 1px dashed var(--line);
-    border-radius: 8px;
-    padding: 8px;
-    background: var(--card);
-    display: flex; flex-direction: column; gap: 8px;
+  .ref-toggle:hover { color: var(--accent-hi); text-decoration: underline; background: transparent; border-color: transparent; }
+
+  .label {
+    font-size: 11px;
+    color: var(--sub);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+  }
+
+  .ref-box, .outliers-section {
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 14px;
+    background: var(--card-bg);
+    display: flex; flex-direction: column; gap: 10px;
   }
   .ref-box textarea {
-    min-height: 48px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    min-height: 56px;
     font-size: 12px;
   }
-  .ref-thumbs {
-    display: flex; flex-wrap: wrap; gap: 6px;
-  }
+  .ref-thumbs { display: flex; flex-wrap: wrap; gap: 8px; }
   .ref-thumb {
     position: relative;
-    width: 96px; height: 54px;          /* 16:9 mini preview */
-    border-radius: 6px;
+    width: 112px; height: 63px;
+    border-radius: 8px;
     overflow: hidden;
-    background: #000;
+    background: var(--thumb-bg);
     border: 1px solid var(--line);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
   }
   .ref-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .ref-thumb .badge {
-    position: absolute; top: 2px; left: 2px;
-    background: rgba(0,0,0,0.6); color: #fff;
-    font-size: 10px; padding: 1px 4px; border-radius: 3px;
+    position: absolute; top: 4px; left: 4px;
+    background: rgba(0,0,0,0.75); color: #fff;
+    font-size: 10px; padding: 2px 6px; border-radius: 100px;
+    font-weight: 600;
   }
-  .outliers-section {
-    border: 1px dashed var(--line);
-    border-radius: 8px;
-    padding: 8px;
-    background: var(--card);
-    display: flex; flex-direction: column; gap: 8px;
-  }
+
   .outliers-header {
     display: flex; justify-content: space-between; align-items: center;
     gap: 8px;
   }
-  .outliers-header .title { font-weight: 600; font-size: 13px; }
-  .outliers-header .sub { color: var(--sub); font-size: 11px; }
+  .outliers-header .title { font-weight: 600; font-size: 13.5px; color: var(--ink); }
+  .outliers-header .sub { color: var(--sub); font-size: 11.5px; font-weight: 400; margin-left: 6px; }
+
   .outliers-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-    gap: 8px;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 14px;
   }
+
+  /* Viral-card style outlier — rounded thumb on top, meta block underneath,
+     gradient outlier pill, hover lift. Mirrors the algrow viral discovery
+     card layout. */
   .outlier-card {
-    position: relative;
-    border-radius: 8px;
-    overflow: hidden;
+    display: flex; flex-direction: column;
+    gap: 10px;
     cursor: pointer;
-    border: 2px solid transparent;
-    background: #000;
-    transition: transform 0.08s ease, border-color 0.08s ease;
+    background: rgba(20,20,20,0.5);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 10px;
+    overflow: hidden;
+    transition: transform .25s ease, background-color .25s ease,
+                border-color .25s ease, box-shadow .25s ease;
   }
-  .outlier-card:hover { transform: translateY(-1px); }
-  .outlier-card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+  .outlier-card:hover {
+    transform: translateY(-4px);
+    background: var(--card-hi);
+    border-color: var(--line-hi);
+    box-shadow: 0 10px 24px rgba(0,0,0,0.5);
+  }
+  .outlier-card.selected {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent), 0 8px 20px rgba(77,156,255,0.35);
+    background: var(--card-hi);
+  }
   .outlier-card .thumb-wrap {
+    position: relative;
     width: 100%; aspect-ratio: 16/9;
-    display: flex; align-items: center; justify-content: center;
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--thumb-bg);
+    box-shadow: 0 3px 10px rgba(0,0,0,0.3);
   }
-  .outlier-card img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .outlier-card .thumb-wrap img {
+    width: 100%; height: 100%;
+    object-fit: cover; display: block;
+    transition: transform .3s ease;
+  }
+  .outlier-card:hover .thumb-wrap img { transform: scale(1.05); }
+
   .outlier-card .score-badge {
-    position: absolute; top: 4px; right: 4px;
-    background: rgba(0,0,0,0.7); color: #fff;
-    font-size: 11px; font-weight: 600;
-    padding: 2px 6px; border-radius: 4px;
+    position: absolute; top: 6px; left: 6px;
+    background: linear-gradient(135deg, var(--outlier-a), var(--outlier-b));
+    color: #fff;
+    font-size: 11px; font-weight: 700;
+    padding: 4px 10px; border-radius: 100px;
+    line-height: 1;
+    box-shadow: 0 4px 12px rgba(255,107,53,0.4);
+    z-index: 2;
   }
   .outlier-card .check {
-    position: absolute; top: 4px; left: 4px;
-    width: 18px; height: 18px;
+    position: absolute; top: 6px; right: 6px;
+    width: 22px; height: 22px;
     border-radius: 50%;
     background: var(--accent);
-    color: white;
+    color: #fff;
     display: none;
     align-items: center; justify-content: center;
-    font-size: 11px; font-weight: 700;
+    font-size: 12px; font-weight: 700;
+    box-shadow: 0 4px 12px rgba(77,156,255,0.45);
+    z-index: 2;
   }
   .outlier-card.selected .check { display: flex; }
-  .outlier-card .caption {
-    font-size: 11px;
-    padding: 4px 6px;
-    background: rgba(0,0,0,0.55);
+
+  .outlier-card .o-meta {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: 0 2px 2px;
+    min-width: 0;
+  }
+  .outlier-card .o-meta-top {
+    display: flex; align-items: baseline; gap: 6px;
+    color: var(--sub); font-size: 11.5px;
+  }
+  .outlier-card .o-views { color: var(--accent); font-weight: 700; font-size: 12px; }
+  .outlier-card .o-dot { opacity: 0.5; }
+  .outlier-card .o-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    margin: 0;
+  }
+  .outlier-card .o-channel {
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 2px;
+    min-width: 0;
+  }
+  .outlier-card .o-avatar {
+    width: 24px; height: 24px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--avatar-bg);
     color: #fff;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    position: absolute; left: 0; right: 0; bottom: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 11px;
+    overflow: hidden;
+  }
+  .outlier-card .o-avatar img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .outlier-card .o-channel-name {
+    font-size: 11.5px;
+    color: var(--sub);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
   }
 </style>
 </head>
@@ -197,12 +564,15 @@
   </div>
   <div class="meta" id="meta" style="display:none;"></div>
 
-  <div id="title-box" style="display:none; flex-direction:column; gap:4px; margin-bottom:8px;">
-    <label for="title" style="font-size:11px; color:var(--sub); text-transform:uppercase; letter-spacing:0.04em;">Title</label>
-    <input id="title" type="text" placeholder="What's the video / thumbnail about?" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--fg); font-size:13px;">
+  <div id="title-box" style="display:none; flex-direction:column; gap:6px;">
+    <label class="label" for="title">Title</label>
+    <input id="title" type="text" placeholder="What's the video / thumbnail about?">
   </div>
 
-  <textarea id="prompt" placeholder="e.g. Cinematic close-up of a hooded figure in fog, neon highlights, dramatic lighting"></textarea>
+  <div style="display:flex; flex-direction:column; gap:6px;">
+    <label class="label" for="prompt">Prompt</label>
+    <textarea id="prompt" placeholder="e.g. Cinematic close-up of a hooded figure in fog, neon highlights, dramatic lighting"></textarea>
+  </div>
 
   <div class="row" style="flex-wrap: wrap;">
     <button class="ref-toggle" id="ref-toggle" type="button">+ Add reference images (URLs)</button>
@@ -218,8 +588,8 @@
       <button class="ref-toggle" id="outliers-close-btn" type="button">× Close</button>
     </div>
     <div class="outliers-grid" id="outliers-grid"></div>
-    <div id="compose-row" style="display:none; align-items:center; gap:8px; margin-top:8px;">
-      <span style="font-size:12px; color:var(--sub);" id="compose-hint">Pick a reference above, then engineer the prompt from it ↓</span>
+    <div id="compose-row" style="display:none; align-items:center; gap:8px; margin-top:4px;">
+      <span class="hint" id="compose-hint">Pick a reference above, then engineer the prompt from it ↓</span>
       <span style="flex:1;"></span>
       <button class="primary" id="compose-btn" type="button" disabled>Create Prompt</button>
     </div>
@@ -231,23 +601,44 @@
   </div>
 
   <div class="row">
-    <select id="aspect">
-      <option value="16:9" selected>16:9 (YouTube)</option>
-      <option value="9:16">9:16 (Shorts/Reels)</option>
-      <option value="1:1">1:1 (Square)</option>
-      <option value="4:5">4:5 (Instagram portrait)</option>
-      <option value="3:2">3:2</option>
-    </select>
-    <select id="resolution">
-      <option value="2K" selected>2K</option>
-      <option value="1K">1K</option>
-      <option value="4K">4K</option>
-    </select>
-    <select id="style-preset" title="Composition preset — picks the design rules applied to the prompt">
-      <option value="person_focal" selected>Person-focal</option>
-      <option value="faceless">Faceless</option>
-      <option value="none">No preset</option>
-    </select>
+    <div class="dropdown-wrapper" data-input-id="aspect" data-default-value="16:9">
+      <button type="button" class="dropdown-btn">
+        <span class="dropdown-text">16:9 (YouTube)</span>
+        <svg class="dropdown-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6,9 12,15 18,9"/></svg>
+      </button>
+      <div class="dropdown-menu">
+        <div class="dropdown-item" data-value="16:9">16:9 (YouTube)</div>
+        <div class="dropdown-item" data-value="9:16">9:16 (Shorts/Reels)</div>
+        <div class="dropdown-item" data-value="1:1">1:1 (Square)</div>
+        <div class="dropdown-item" data-value="4:5">4:5 (Instagram portrait)</div>
+        <div class="dropdown-item" data-value="3:2">3:2</div>
+      </div>
+      <input type="hidden" id="aspect" value="16:9">
+    </div>
+    <div class="dropdown-wrapper" data-input-id="resolution" data-default-value="2K">
+      <button type="button" class="dropdown-btn">
+        <span class="dropdown-text">2K</span>
+        <svg class="dropdown-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6,9 12,15 18,9"/></svg>
+      </button>
+      <div class="dropdown-menu">
+        <div class="dropdown-item" data-value="2K">2K</div>
+        <div class="dropdown-item" data-value="1K">1K</div>
+        <div class="dropdown-item" data-value="4K">4K</div>
+      </div>
+      <input type="hidden" id="resolution" value="2K">
+    </div>
+    <div class="dropdown-wrapper" data-input-id="style-preset" data-default-value="person_focal" title="Composition preset — picks the design rules applied to the prompt">
+      <button type="button" class="dropdown-btn">
+        <span class="dropdown-text">Person-focal</span>
+        <svg class="dropdown-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6,9 12,15 18,9"/></svg>
+      </button>
+      <div class="dropdown-menu">
+        <div class="dropdown-item" data-value="person_focal">Person-focal</div>
+        <div class="dropdown-item" data-value="faceless">Faceless</div>
+        <div class="dropdown-item" data-value="none">No preset</div>
+      </div>
+      <input type="hidden" id="style-preset" value="person_focal">
+    </div>
     <span style="flex:1;"></span>
     <button class="primary" id="generate">Generate</button>
   </div>
@@ -309,6 +700,13 @@ let lastResultPayload = null;
 // multi-turn editing where the prior output is what Gemini modifies.
 let priorImageForReference = null;
 
+// Last SUCCESSFUL render. Separate from lastResultPayload so a subsequent
+// failed refinement (BlockedReason, network blip, etc.) doesn't overwrite
+// the previously-working image — refresh should restore the last image the
+// user actually saw, not the last error they hit. lastResultPayload still
+// reflects the most recent terminal state for in-session continuity.
+let lastSuccessPayload = null;
+
 // Cross-device persistence — the server keeps a per-title JSON store and
 // the widget reads/writes it via callServerTool. claude.ai doesn't expose
 // a state API, but callServerTool from the widget is silent in the chat
@@ -337,6 +735,7 @@ async function saveStateNow() {
           promptIsComposed,
           selectedOutlier,
           lastResultPayload,
+          lastSuccessPayload,
           priorImageForReference,
           stylePreset: stylePresetEl?.value,
           aspectRatio: aspectEl?.value,
@@ -406,6 +805,16 @@ function fmtScore(s) {
   if (!Number.isFinite(n)) return "";
   return `${n.toFixed(1)}×`;
 }
+function fmtViews(n) {
+  if (n == null) return null;
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(n >= 10_000 ? 0 : 1) + "K";
+  return String(n);
+}
+function initial(name) {
+  const c = (name || "?").trim().replace(/^@/, "").charAt(0).toUpperCase();
+  return c || "?";
+}
 
 function isUrlInRefs(url) {
   if (!url) return false;
@@ -448,14 +857,134 @@ function setSingleRefInUrls(url) {
   return !isSame;  // true when newly selected, false when cleared
 }
 
+// Stage-by-stage one-shot pipeline. Called when extract_reference_from_video
+// returns auto_pipeline:true (user gave Claude a title + reference URL in
+// one turn). Mounts the widget immediately, then chains:
+//   1. compose_thumbnail_prompt    (~20s, "Engineering prompt…")
+//   2. generate_thumbnail          (~25-40s, "Generating thumbnail…")
+// Each step is a callServerTool — well under claude.ai's MCP timeout per
+// call — and the user sees live progress between stages instead of a
+// single blank wait.
+let _autoPipelineRunning = false;
+async function runAutoPipeline(app, ref, title) {
+  if (_autoPipelineRunning) return;
+  _autoPipelineRunning = true;
+  const stylePreset = stylePresetEl?.value || "none";
+
+  // Persist a "started" marker immediately so a mid-flight refresh sees
+  // saved state and DOES NOT re-fire the pipeline (3 credits per dry-run).
+  // Synchronous (await) — must land in the store before any await that
+  // could yield to a parallel mount handler. Without this marker, the
+  // saveState fired by render() only kicks in once the generate_thumbnail
+  // call returns pending — leaving a multi-second window where a refresh
+  // would double-fire.
+  lastResultPayload = {
+    state: "pending",
+    auto_pipeline_started: true,
+    started_at: Date.now(),
+  };
+  await saveStateNow();
+
+  try {
+    // Stage 1: compose. We DO NOT call setLoading(true) here — that helper
+    // overwrites the preview pane with the generic "Generating thumbnail"
+    // loader, which is wrong during this step (we're engineering the
+    // prompt, not painting yet). Manually disable the Generate button so
+    // the visible state still reflects "work in progress".
+    if (preview) {
+      preview.innerHTML = loaderHtml("Engineering prompt", "Analyzing your reference…");
+    }
+    generateBtn.disabled = true;
+    generateBtn.textContent = "Generating…";
+    let composeData = null;
+    try {
+      const res = await app.callServerTool({
+        name: "compose_thumbnail_prompt",
+        arguments: {
+          title,
+          reference_url: ref.thumbnail_url,
+          reference_title: ref.title || undefined,
+          style_preset: stylePreset,
+        },
+      });
+      const text = res?.content?.[0]?.text ?? "";
+      composeData = text ? JSON.parse(text) : null;
+    } catch (err) {
+      if (preview) preview.innerHTML = `<div class="err">Compose failed: ${escape(err.message || String(err))}</div>`;
+      setLoading(false);
+      return;
+    }
+    if (!composeData?.success || !composeData?.prompt) {
+      if (preview) preview.innerHTML = `<div class="err">Compose returned no prompt: ${escape(composeData?.error || "unknown")}</div>`;
+      setLoading(false);
+      return;
+    }
+    if (promptEl) promptEl.value = composeData.prompt;
+    promptIsComposed = true;
+    saveState();
+
+    // Stage 2: generate. Use the SAME loader label that render()'s pending
+    // branch installs during polling — that way the auto-pipeline's
+    // Stage-2 placeholder and the subsequent polling loader read as one
+    // continuous "Generating thumbnail" state, rather than a misleading
+    // "Step 2/2 — Painting…" that hangs visible after the image arrives.
+    if (preview) {
+      preview.innerHTML = loaderHtml("Generating thumbnail", "Nano Banana Pro · usually 30–90s");
+    }
+    let genData = null;
+    try {
+      const res = await app.callServerTool({
+        name: "generate_thumbnail",
+        arguments: {
+          prompt: composeData.prompt,
+          aspect_ratio: aspectEl?.value || "16:9",
+          resolution: resolutionEl?.value || "2K",
+          reference_urls: [ref.thumbnail_url],
+          style_preset: "none",
+          analyze_references: false,
+        },
+      });
+      const text = res?.content?.[0]?.text ?? "";
+      genData = text ? JSON.parse(text) : null;
+    } catch (err) {
+      if (preview) preview.innerHTML = `<div class="err">Generation failed: ${escape(err.message || String(err))}</div>`;
+      setLoading(false);
+      return;
+    }
+    if (genData) {
+      // Render through the standard result path so all post-success logic
+      // (lastResultPayload, saveState, meta, click-to-open) runs.
+      render(genData, app);
+    } else {
+      setLoading(false);
+    }
+  } finally {
+    _autoPipelineRunning = false;
+  }
+}
+
+
 function renderOutliers(payload) {
   if (!outliersSection || !outliersGrid) return;
   const list = Array.isArray(payload?.outliers) ? payload.outliers : [];
   outliersSection.style.display = "flex";
+  // Header text differs by mode:
+  //   - single_reference: just "Reference" — no count / topic / content
+  //     type, those are noise when there's one pre-selected video.
+  //   - multi-reference picker: "Outliers on your topic · X found · ..."
+  const headerTitle = outliersSection.querySelector(".outliers-header .title");
+  if (headerTitle) {
+    const titleNode = headerTitle.childNodes[0];
+    if (titleNode) titleNode.textContent = payload?.single_reference ? "Reference " : "Outliers on your topic ";
+  }
   if (outliersMeta) {
-    const topic = payload?.topic ? `· "${payload.topic}"` : "";
-    const ct = payload?.content_type ? `· ${payload.content_type}` : "";
-    outliersMeta.textContent = `${list.length} found ${topic} ${ct}`.replace(/\s+/g, " ").trim();
+    if (payload?.single_reference) {
+      outliersMeta.textContent = "";
+    } else {
+      const topic = payload?.topic ? `· "${payload.topic}"` : "";
+      const ct = payload?.content_type ? `· ${payload.content_type}` : "";
+      outliersMeta.textContent = `${list.length} found ${topic} ${ct}`.replace(/\s+/g, " ").trim();
+    }
   }
   if (payload?.error) {
     outliersGrid.innerHTML = `<div class="err" style="padding:6px;">${escape(payload.error)}</div>`;
@@ -471,13 +1000,28 @@ function renderOutliers(payload) {
     const card = document.createElement("div");
     card.className = "outlier-card" + (isUrlInRefs(o.thumbnail_url) ? " selected" : "");
     card.title = `${o.title || ""}\n${o.channel_name || ""}`;
+    const viewsText = fmtViews(o.view_count);
+    const score = fmtScore(o.outlier_score);
     card.innerHTML = `
       <div class="thumb-wrap">
         <img src="${escape(o.thumbnail_url)}" referrerpolicy="no-referrer" alt="">
+        ${score ? `<div class="score-badge">${escape(score)}</div>` : ""}
+        <div class="check">✓</div>
       </div>
-      <div class="score-badge">${escape(fmtScore(o.outlier_score))}</div>
-      <div class="check">✓</div>
-      <div class="caption">${escape(o.title || "")}</div>
+      <div class="o-meta">
+        ${viewsText ? `<div class="o-meta-top"><span class="o-views">${escape(viewsText)} views</span></div>` : ""}
+        <h3 class="o-title">${escape(o.title || "(no title)")}</h3>
+        ${o.channel_name ? `
+          <div class="o-channel">
+            <div class="o-avatar">${
+              o.channel_thumbnail
+                ? `<img src="${escape(o.channel_thumbnail)}" alt="" referrerpolicy="no-referrer" onerror="this.replaceWith(document.createTextNode('${escape(initial(o.channel_name))}'))">`
+                : escape(initial(o.channel_name))
+            }</div>
+            <span class="o-channel-name">${escape(o.channel_name)}</span>
+          </div>
+        ` : ""}
+      </div>
     `;
     card.addEventListener("click", () => {
       const added = setSingleRefInUrls(o.thumbnail_url);
@@ -530,9 +1074,43 @@ function renderRefThumbs() {
   });
 }
 
+function loaderHtml(label, sub) {
+  // Inline SVG sparkle icon — four-pointed star with two small accent stars.
+  // Avoids pulling in a webfont (FontAwesome / Material) just for one glyph.
+  const icon =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+      '<path d="M12 3l1.9 5.8a2 2 0 0 0 1.3 1.3L21 12l-5.8 1.9a2 2 0 0 0-1.3 1.3L12 21l-1.9-5.8a2 2 0 0 0-1.3-1.3L3 12l5.8-1.9a2 2 0 0 0 1.3-1.3L12 3z"/>' +
+      '<path d="M5 3v4"/><path d="M3 5h4"/>' +
+      '<path d="M19 17v4"/><path d="M17 19h4"/>' +
+    '</svg>';
+  return (
+    '<div class="gen-loader">' +
+      '<div class="gen-loader-stage">' +
+        '<div class="gen-loader-ripple r1"></div>' +
+        '<div class="gen-loader-ripple r2"></div>' +
+        '<div class="gen-loader-ripple r3"></div>' +
+        '<div class="gen-loader-particle p1"></div>' +
+        '<div class="gen-loader-particle p2"></div>' +
+        '<div class="gen-loader-particle p3"></div>' +
+        '<div class="gen-loader-particle p4"></div>' +
+        '<div class="gen-loader-particle p5"></div>' +
+        '<div class="gen-loader-particle p6"></div>' +
+        '<div class="gen-loader-particle p7"></div>' +
+        '<div class="gen-loader-particle p8"></div>' +
+        '<div class="gen-loader-icon">' + icon + '</div>' +
+      '</div>' +
+      '<div class="gen-loader-inner">' +
+        (label ? `<div class="gen-loader-label">${escape(label)}</div>` : "") +
+        (sub ? `<div class="gen-loader-sub">${escape(sub)}</div>` : "") +
+        '<div class="gen-loader-bar"><div class="gen-loader-bar-fill"></div></div>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
 function setLoading(state) {
   if (state) {
-    preview.innerHTML = '<div class="spinner"></div>';
+    preview.innerHTML = loaderHtml("Generating thumbnail", "Nano Banana Pro · usually 30–90s");
     generateBtn.disabled = true;
     generateBtn.textContent = "Generating…";
   } else {
@@ -633,6 +1211,15 @@ function render(payload, app, opts = {}) {
     if (titleEl && !titleEl.value) titleEl.value = titleVal;
     renderOutliers(payload);
 
+    // "Find outliers on this topic" only makes sense when the user is
+    // picking from a set of candidates. In single_reference mode (user
+    // pasted a specific YouTube URL via extract_reference_from_video)
+    // the reference is already chosen — exposing the find button would
+    // suggest they should second-guess it.
+    if (outliersBtn) {
+      outliersBtn.style.display = payload.single_reference ? "none" : "";
+    }
+
     // Single-reference mode (user pasted a specific YouTube video) —
     // auto-select that card so they skip the picking step.
     if (payload.single_reference && Array.isArray(payload.outliers) && payload.outliers.length === 1) {
@@ -664,8 +1251,115 @@ function render(payload, app, opts = {}) {
       saveState();
     }
 
+    // Auto-pipeline path — extract_reference_from_video was called with a
+    // user_title, signaling the user wants the full pipeline run. Fire
+    // compose + generate via callServerTool with live stage indicators
+    // between, rather than waiting for the user to click Create Prompt
+    // and Generate manually.
+    //
+    // BUT: on page refresh, claude.ai re-emits the original tool result,
+    // so we'd trigger a SECOND generation (3 credits) for work already
+    // done. Check the per-title server state first — if a non-pending
+    // result is stored, restore it instead of re-running.
+    if (payload.auto_pipeline && payload.single_reference && Array.isArray(payload.outliers) && payload.outliers.length === 1 && titleEl?.value) {
+      refreshComposeRow();
+      (async () => {
+        const saved = await loadStateForTitleAsync(titleEl.value);
+        // The current payload's outlier is authoritative for which video
+        // we're working with — that's what Claude actually re-emitted on
+        // refresh. The saved selectedOutlier may be from a SUBSEQUENT user
+        // action (e.g. a refinement with a different reference video) that
+        // got persisted but is no longer the active picker selection.
+        // Only restore the saved outlier if it matches the current one.
+        const currentRefUrl = payload?.outliers?.[0]?.thumbnail_url;
+        const restoreWidgetState = () => {
+          if (saved.prompt && promptEl && !promptEl.value) {
+            promptEl.value = saved.prompt;
+            promptIsComposed = !!saved.promptIsComposed;
+          }
+          if (saved.selectedOutlier?.thumbnail_url
+              && saved.selectedOutlier.thumbnail_url === currentRefUrl) {
+            selectedOutlier = saved.selectedOutlier;
+            setSingleRefInUrls(saved.selectedOutlier.thumbnail_url);
+            outliersGrid.querySelectorAll(".outlier-card").forEach((c) => {
+              const img = c.querySelector("img");
+              if (img && img.src === saved.selectedOutlier.thumbnail_url) {
+                c.classList.add("selected");
+              }
+            });
+          }
+          if (saved.priorImageForReference) priorImageForReference = saved.priorImageForReference;
+        };
+        // ANY saved state for this title blocks re-firing the pipeline.
+        // We never want a refresh to burn fresh credits. Resolution order:
+        //   1. lastSuccessPayload     → restore the last working image
+        //      (overrides any subsequent failed refinement).
+        //   2. lastResultPayload      → terminal fail (no prior success to
+        //      fall back to) or pending state.
+        //   3. "started" marker only  → pipeline crashed/hung between
+        //      start and first save. Show a static loader.
+        const successPayload = saved?.lastSuccessPayload;
+        const resultPayload = saved?.lastResultPayload;
+        if (successPayload || resultPayload) {
+          restoreWidgetState();
+          if (successPayload) {
+            render(successPayload, app, { skipSave: true });
+            return;
+          }
+          const p = resultPayload;
+          if (p.state === "success" || p.state === "fail") {
+            render(p, app, { skipSave: true });
+            return;
+          }
+          if (p.state === "pending" && p.task_id) {
+            render(p, app, { skipSave: true });
+            return;
+          }
+          if (preview) {
+            preview.innerHTML = loaderHtml(
+              "Generating thumbnail",
+              "Resuming previous run…"
+            );
+          }
+          return;
+        }
+        runAutoPipeline(app, payload.outliers[0], titleEl.value);
+      })();
+      return;
+    }
+
+    // One-shot path (legacy / direct payload) — server ran the whole
+    // pipeline and packaged the finished image into the picker payload.
+    // Render the image instead of a "next steps" hint, and save the
+    // result so multi-turn editing kicks in on the next refinement.
+    const hasInlineResult = payload.state === "success" && Array.isArray(payload.images) && payload.images.length;
+    const hasInlineError = payload.state === "fail" || (payload.error && !hasInlineResult);
     if (preview) {
-      if (payload.refined_prompt) {
+      if (hasInlineResult) {
+        const url = payload.images[0];
+        preview.innerHTML = `<img src="${escape(url)}" referrerpolicy="no-referrer" alt="generated thumbnail">`;
+        const img = preview.querySelector("img");
+        if (img) img.addEventListener("click", () => { app.openLink({ url }).catch(() => {}); });
+        const bits = [];
+        if (payload.aspect_ratio) bits.push(payload.aspect_ratio);
+        if (payload.resolution) bits.push(payload.resolution);
+        if (payload.cost_time_s != null) bits.push(`${Number(payload.cost_time_s).toFixed(1)}s`);
+        bits.push(`<a href="${escape(url)}" data-open>Open full size</a>`);
+        meta.innerHTML = bits.join(" · ");
+        meta.style.display = "flex";
+        meta.querySelectorAll("a[data-open]").forEach((a) => {
+          a.addEventListener("click", (e) => {
+            e.preventDefault();
+            app.openLink({ url: a.getAttribute("href") }).catch(() => {});
+          });
+        });
+        lastResultPayload = payload;
+        lastSuccessPayload = payload;
+        saveState();
+      } else if (hasInlineError) {
+        preview.innerHTML = `<div class="err">${escape(payload.error || "Generation failed")}</div>`;
+        meta.style.display = "none";
+      } else if (payload.refined_prompt) {
         preview.innerHTML = `<div class="empty">Prompt refined and ready below — review the changes, then click <b>Generate</b>.</div>`;
       } else {
         preview.innerHTML = payload.single_reference
@@ -681,11 +1375,10 @@ function render(payload, app, opts = {}) {
     // user briefly sees the picker, then sees their prior WIP appear
     // (selected card, composed prompt, last result).
     //
-    // EXCEPTION: if this mount came with a refined_prompt, the user is
-    // explicitly starting a new generation — don't auto-restore a stale
-    // image into the preview pane. The new prompt is the "current state",
-    // not the previous result.
-    const skipResultRestore = !!payload.refined_prompt;
+    // EXCEPTION: if this mount already has a result rendered (inline image
+    // from the one-shot pipeline, or a refined_prompt starting a new run),
+    // don't let the async restore overwrite the preview pane.
+    const skipResultRestore = !!payload.refined_prompt || hasInlineResult;
     (async () => {
       const saved = await loadStateForTitleAsync(titleEl?.value);
       if (!saved) return;
@@ -703,9 +1396,9 @@ function render(payload, app, opts = {}) {
           }
         });
       }
-      if (saved.stylePreset && stylePresetEl) stylePresetEl.value = saved.stylePreset;
-      if (saved.aspectRatio && aspectEl) aspectEl.value = saved.aspectRatio;
-      if (saved.resolution && resolutionEl) resolutionEl.value = saved.resolution;
+      if (saved.stylePreset && stylePresetEl) setDropdownValue(stylePresetEl, saved.stylePreset);
+      if (saved.aspectRatio && aspectEl) setDropdownValue(aspectEl, saved.aspectRatio);
+      if (saved.resolution && resolutionEl) setDropdownValue(resolutionEl, saved.resolution);
       if (saved.priorImageForReference) priorImageForReference = saved.priorImageForReference;
       refreshComposeRow();
       if (skipResultRestore) return;
@@ -720,9 +1413,9 @@ function render(payload, app, opts = {}) {
   }
   // Restore the prompt the user submitted so subsequent edits start from it.
   if (payload.prompt && !promptEl.value) promptEl.value = payload.prompt;
-  if (payload.aspect_ratio) aspectEl.value = payload.aspect_ratio;
-  if (payload.resolution) resolutionEl.value = payload.resolution;
-  if (payload.style_preset && stylePresetEl) stylePresetEl.value = payload.style_preset;
+  if (payload.aspect_ratio) setDropdownValue(aspectEl, payload.aspect_ratio);
+  if (payload.resolution) setDropdownValue(resolutionEl, payload.resolution);
+  if (payload.style_preset && stylePresetEl) setDropdownValue(stylePresetEl, payload.style_preset);
 
   // Outliers can ride along with ANY payload (pending / success / fail) when
   // generate_thumbnail was called with find_outliers_first=true. Render them
@@ -756,9 +1449,9 @@ function render(payload, app, opts = {}) {
     renderRefThumbs();
   }
 
-  // Generation in flight — show spinner and start (or keep) polling.
+  // Generation in flight — show loader and start (or keep) polling.
   if (payload.state === "pending" && payload.task_id) {
-    preview.innerHTML = '<div class="spinner"></div>';
+    preview.innerHTML = loaderHtml("Generating thumbnail", "Nano Banana Pro · usually 30–90s");
     meta.style.display = "none";
     setLoading(true);
     if (activePollTaskId !== payload.task_id) {
@@ -772,6 +1465,12 @@ function render(payload, app, opts = {}) {
         outliers: payload.outliers,
         outlier_topic: payload.outlier_topic,
       });
+    }
+    // Persist the pending payload (including task_id + poll args) so a
+    // refresh mid-poll can resume the same Kie task instead of re-firing.
+    if (!opts.skipSave) {
+      lastResultPayload = payload;
+      saveState();
     }
     return;
   }
@@ -819,9 +1518,13 @@ function render(payload, app, opts = {}) {
   });
   setLoading(false);
   // Persist successful generation so chat close/reopen restores the image
-  // instead of dropping the user back at the picker.
+  // instead of dropping the user back at the picker. ALSO mirror into
+  // lastSuccessPayload so a subsequent failed refinement (BlockedReason)
+  // doesn't wipe the working image — refresh should restore the last
+  // image the user actually saw.
   if (!opts.skipSave) {
     lastResultPayload = payload;
+    lastSuccessPayload = payload;
     saveState();
   }
 }
@@ -833,9 +1536,76 @@ function applyHostContext(ctx) {
   }
 }
 
+// Programmatic setter for a custom dropdown — sets the hidden input's value
+// AND updates the button label + active-item highlight. Use this instead of
+// `inputEl.value = X` whenever code changes a dropdown value outside a user
+// click, because hidden inputs don't auto-sync to the visible UI.
+function setDropdownValue(input, value) {
+  if (!input) return;
+  const wrapper = input.closest(".dropdown-wrapper");
+  if (!wrapper) { input.value = value; return; }
+  let matchedLabel = null;
+  wrapper.querySelectorAll(".dropdown-item").forEach((item) => {
+    if (item.dataset.value === value) {
+      matchedLabel = item.textContent.trim();
+      item.classList.add("active");
+    } else {
+      item.classList.remove("active");
+    }
+  });
+  input.value = value;
+  const text = wrapper.querySelector(".dropdown-text");
+  if (text && matchedLabel) text.textContent = matchedLabel;
+}
+
+function initDropdowns() {
+  const wrappers = document.querySelectorAll(".dropdown-wrapper");
+  wrappers.forEach((wrapper) => {
+    const btn = wrapper.querySelector(".dropdown-btn");
+    const menu = wrapper.querySelector(".dropdown-menu");
+    const input = wrapper.querySelector("input[type=hidden]");
+    if (!btn || !menu || !input) return;
+
+    // Mark the default-selected item as active on first render.
+    const defaultVal = wrapper.dataset.defaultValue || input.value;
+    wrapper.querySelectorAll(".dropdown-item").forEach((item) => {
+      if (item.dataset.value === defaultVal) item.classList.add("active");
+    });
+
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const isOpen = menu.classList.contains("show");
+      // Close all other menus first so only one is ever open.
+      document.querySelectorAll(".dropdown-menu.show").forEach((m) => m.classList.remove("show"));
+      document.querySelectorAll(".dropdown-btn.active").forEach((b) => b.classList.remove("active"));
+      if (!isOpen) {
+        menu.classList.add("show");
+        btn.classList.add("active");
+      }
+    });
+
+    wrapper.querySelectorAll(".dropdown-item").forEach((item) => {
+      item.addEventListener("click", (e) => {
+        e.stopPropagation();
+        setDropdownValue(input, item.dataset.value);
+        menu.classList.remove("show");
+        btn.classList.remove("active");
+        // Fire change so the existing saveState listener still runs.
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    });
+  });
+  // Global click-outside handler — closes any open menu.
+  document.addEventListener("click", () => {
+    document.querySelectorAll(".dropdown-menu.show").forEach((m) => m.classList.remove("show"));
+    document.querySelectorAll(".dropdown-btn.active").forEach((b) => b.classList.remove("active"));
+  });
+}
+
 (async () => {
   const app = new App({ name: "ThumbnailStudio", version: "1.0.0" }, {}, { autoResize: true });
   _appRef = app;  // make available to save/load helpers
+  initDropdowns();
 
   app.ontoolresult = ({ content }) => {
     try {

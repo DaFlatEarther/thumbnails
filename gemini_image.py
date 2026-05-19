@@ -147,6 +147,12 @@ def generate_image(
         image_config=types.ImageConfig(
             aspect_ratio=aspect_ratio,
             image_size=resolution,
+            # NOTE: person_generation is NOT settable on the Developer API
+            # tier (it errors out — only available on Gemini Enterprise
+            # Agent Platform). The Developer API uses its own defaults
+            # which already allow most adult public figures, so we rely on
+            # those + the prompt-side guidance for naming celebrities
+            # directly.
         ),
     )
 
@@ -162,14 +168,50 @@ def generate_image(
 
     cost_time = round(_time.time() - started, 2)
 
-    # Walk response parts; ignore "thought" parts (interim images during
-    # the Thinking phase) and return the first real image part.
+    # When Gemini blocks the prompt (safety filter, recitation, etc.) it
+    # returns a response with parts=None and a populated prompt_feedback
+    # or candidate.finish_reason field instead. Surface that reason so the
+    # caller doesn't see a generic TypeError ("NoneType is not iterable").
+    response_parts = response.parts if getattr(response, "parts", None) is not None else None
+    if not response_parts:
+        block_reason = None
+        # Check prompt_feedback for a top-level block.
+        feedback = getattr(response, "prompt_feedback", None)
+        if feedback is not None:
+            block_reason = (
+                getattr(feedback, "block_reason_message", None)
+                or getattr(feedback, "block_reason", None)
+            )
+        # Check the first candidate's finish_reason (e.g. SAFETY, RECITATION,
+        # IMAGE_SAFETY, IMAGE_PROHIBITED_CONTENT, PROHIBITED_CONTENT).
+        candidate_finish = None
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            candidate_finish = getattr(candidates[0], "finish_reason", None)
+            if hasattr(candidate_finish, "name"):
+                candidate_finish = candidate_finish.name
+        reason_bits = [str(x) for x in (block_reason, candidate_finish) if x]
+        reason_str = " / ".join(reason_bits) or "no image part and no block reason"
+        return {
+            "success": False,
+            "error": (
+                f"Gemini returned no image — {reason_str}. "
+                "This usually means a safety filter triggered (e.g. a named "
+                "public figure, brand, or sensitive subject). Try editing the "
+                "prompt to remove specific names or sensitive details, then "
+                "regenerate."
+            ),
+            "cost_time_s": cost_time,
+        }
+
+    # Walk parts; ignore "thought" parts (interim images during the
+    # Thinking phase) and return the first real image part.
     try:
-        for part in response.parts:
+        for part in response_parts:
             if getattr(part, "thought", False):
                 continue
             inline = getattr(part, "inline_data", None)
-            if inline is None or not inline.data:
+            if inline is None or not getattr(inline, "data", None):
                 continue
             data = inline.data
             if isinstance(data, str):
@@ -185,4 +227,4 @@ def generate_image(
     except Exception as e:
         return {"success": False, "error": f"Couldn't parse Gemini response: {str(e)[:200]}", "cost_time_s": cost_time}
 
-    return {"success": False, "error": "Gemini response contained no image part", "cost_time_s": cost_time}
+    return {"success": False, "error": "Gemini response contained parts but no image data.", "cost_time_s": cost_time}
