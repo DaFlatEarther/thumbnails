@@ -91,10 +91,10 @@ def submit_image(
                 "Content-Type": "application/json",
             },
             json=body,
-            timeout=30,
+            timeout=60,
         )
     except requests.exceptions.Timeout:
-        return {"success": False, "error": "Algrow submit timed out (>30s)."}
+        return {"success": False, "error": "Algrow submit timed out (>60s)."}
     except Exception as e:
         return {"success": False, "error": f"Algrow submit failed: {str(e)[:200]}"}
 
@@ -133,7 +133,7 @@ def check_image_status(task_id: str) -> dict[str, Any]:
         resp = requests.get(
             f"{_API_BASE}/api/job-status/{quote_plus(job_id)}",
             headers={"Authorization": f"Bearer {_API_KEY}"},
-            timeout=15,
+            timeout=30,
         )
     except Exception as e:
         # Treat as pending so the widget keeps polling instead of bailing.

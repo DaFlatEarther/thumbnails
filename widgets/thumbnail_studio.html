@@ -1147,7 +1147,7 @@ function escape(s) {
 let activePollTaskId = null;
 let pollTimer = null;
 const POLL_INTERVAL_MS = 3000;
-const MAX_POLL_S = 300;   // hard ceiling — Nano Banana Pro should be well
+const MAX_POLL_S = 600;   // hard ceiling — Nano Banana Pro should be well
                           // under 90s; this just prevents a runaway loop
                           // if Kie gets stuck.
 

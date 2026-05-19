@@ -133,6 +133,14 @@ _FRIENDLY_ERROR_PATTERNS = (
         ("service unavailable", "503", "under maintenance"),
         "Kie / Gemini is temporarily unavailable. Try again in a minute.",
     ),
+    (
+        ("fal.ai timed out", "fal-ai timed out", "upstream timed out", "model timed out"),
+        "Seedream's upstream model server (fal.ai) timed out before finishing "
+        "this generation — common on cold queues for the edit model. Try "
+        "Generate again; algrow refunds the credits for the failed attempt. "
+        "If it keeps timing out, switch to Seedream 5.0 Lite (faster) or "
+        "back to Nano Banana Pro.",
+    ),
 )
 
 
