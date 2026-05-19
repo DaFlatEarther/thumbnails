@@ -1028,6 +1028,7 @@ async function runAutoPipeline(app, ref, title) {
     }
     if (promptEl) promptEl.value = composeData.prompt;
     promptIsComposed = true;
+    refreshGenerateBtn();
     saveState();
 
     // Stage 2: generate. Use the SAME loader label that render()'s pending
@@ -1108,9 +1109,24 @@ function renderOutliers(payload) {
     card.title = `${o.title || ""}\n${o.channel_name || ""}`;
     const viewsText = fmtViews(o.view_count);
     const score = fmtScore(o.outlier_score);
+    // Thumbnail fallback chain — algrow returns a tiny ~168×94 mirror URL
+    // (good for their grid, terrible upscaled into our larger card). Try
+    // YouTube's maxresdefault first (1280×720), then hqdefault (480×360),
+    // and only fall back to the stored mirror if both 404 (very old / low-
+    // res uploads). Walks the chain via dataset.step + onerror.
+    const ytId = o.video_id;
+    const primary  = ytId ? `https://i.ytimg.com/vi/${ytId}/maxresdefault.jpg` : o.thumbnail_url;
+    const fallback = ytId ? `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`     : null;
+    const stored   = o.thumbnail_url && o.thumbnail_url !== primary ? o.thumbnail_url : null;
+    const onErr =
+      "var s=this.dataset.step||'0';" +
+      `var f=${JSON.stringify(fallback)};var st=${JSON.stringify(stored)};` +
+      "if (s==='0' && f) { this.dataset.step='1'; this.src=f; return; }" +
+      "if ((s==='0' || s==='1') && st) { this.dataset.step='2'; this.src=st; return; }" +
+      "this.style.display='none';";
     card.innerHTML = `
       <div class="thumb-wrap">
-        <img src="${escape(o.thumbnail_url)}" referrerpolicy="no-referrer" alt="">
+        ${primary ? `<img src="${escape(primary)}" referrerpolicy="no-referrer" alt="" loading="lazy" onerror="${escape(onErr)}">` : ""}
         ${score ? `<div class="score-badge">${escape(score)}</div>` : ""}
         <div class="check">✓</div>
       </div>
@@ -1886,9 +1902,21 @@ function setLoading(state) {
     generateBtn.disabled = true;
     generateBtn.textContent = "Generating…";
   } else {
-    generateBtn.disabled = false;
     generateBtn.textContent = "Generate";
+    refreshGenerateBtn();
   }
+}
+
+// Gate Generate on the prompt having content. Title is optional — Claude
+// can prefill it but the user might want to bypass that step. Prompt is
+// not optional: an empty prompt produces no usable image. Tooltip explains
+// why the button is disabled.
+function refreshGenerateBtn() {
+  if (!generateBtn) return;
+  if (generateBtn.textContent === "Generating…") return;  // mid-flight, leave alone
+  const hasPrompt = !!(promptEl?.value || "").trim();
+  generateBtn.disabled = !hasPrompt;
+  generateBtn.title = hasPrompt ? "" : "Enter a prompt above to enable generation";
 }
 
 function escape(s) {
@@ -2024,6 +2052,7 @@ function render(payload, app, opts = {}) {
     if (payload.refined_prompt && promptEl) {
       promptEl.value = payload.refined_prompt;
       promptIsComposed = true;
+      refreshGenerateBtn();
       if (lastResultPayload?.images?.[0]) {
         priorImageForReference = lastResultPayload.images[0];
       }
@@ -2056,6 +2085,7 @@ function render(payload, app, opts = {}) {
           if (saved.prompt && promptEl && !promptEl.value) {
             promptEl.value = saved.prompt;
             promptIsComposed = !!saved.promptIsComposed;
+            refreshGenerateBtn();
           }
           if (saved.selectedOutlier?.thumbnail_url
               && saved.selectedOutlier.thumbnail_url === currentRefUrl) {
@@ -2161,6 +2191,7 @@ function render(payload, app, opts = {}) {
       if (saved.prompt && promptEl && !promptEl.value) {
         promptEl.value = saved.prompt;
         promptIsComposed = !!saved.promptIsComposed;
+        refreshGenerateBtn();
       }
       if (saved.selectedOutlier?.thumbnail_url) {
         selectedOutlier = saved.selectedOutlier;
@@ -2189,7 +2220,7 @@ function render(payload, app, opts = {}) {
     return;
   }
   // Restore the prompt the user submitted so subsequent edits start from it.
-  if (payload.prompt && !promptEl.value) promptEl.value = payload.prompt;
+  if (payload.prompt && !promptEl.value) { promptEl.value = payload.prompt; refreshGenerateBtn(); }
   if (payload.aspect_ratio) setDropdownValue(aspectEl, payload.aspect_ratio);
   if (payload.resolution) setDropdownValue(resolutionEl, payload.resolution);
   if (payload.style_preset && stylePresetEl) setDropdownValue(stylePresetEl, payload.style_preset);
@@ -2467,8 +2498,12 @@ function initDropdowns() {
   });
   promptEl?.addEventListener("input", () => {
     promptIsComposed = false;
+    refreshGenerateBtn();
     saveState();
   });
+  // Initial gate-check — cold mount with an empty prompt should disable
+  // Generate immediately so the user can't fire a no-op call.
+  refreshGenerateBtn();
   stylePresetEl?.addEventListener("change", saveState);
   modelEl?.addEventListener("change", () => { saveState(); refreshModelHint(); });
   refreshModelHint();  // initial sync — covers cold-mount default of nano-banana-pro
@@ -2512,6 +2547,7 @@ function initDropdowns() {
       }
       promptEl.value = data.prompt;
       promptIsComposed = true;
+      refreshGenerateBtn();
       if (composeHint) composeHint.textContent = "Prompt ready below. Review/edit if you want, then click Generate.";
       composeBtn.textContent = "Recompose";
       composeBtn.disabled = false;
