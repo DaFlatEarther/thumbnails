@@ -263,7 +263,17 @@ def _build_reference_directives(analyses: list[dict]) -> str:
     if insight:
         bullets.append(f"• Why this template works: {insight}")
     bullets.append(
-        "CRITICAL: apply the SAME composition, palette, lighting style, text treatment, and overall style genre to the new subject below. The reference's specific subject/props/text content do NOT carry over — only the design system does."
+        "CRITICAL — REFERENCE USAGE: The reference image attached to this "
+        "request is a DESIGN GUIDE ONLY. Apply its composition, palette, "
+        "lighting style, text treatment, and style genre to the user's new "
+        "subject. NEVER embed, frame, or include the reference image itself "
+        "as a visual element in the output — no picture-in-picture, no inset "
+        "card, no illustration overlay in a corner, no comic-panel-style "
+        "sub-frame, no \"before/after\" duplication of the reference. The "
+        "generated thumbnail must be ONE single new image of the user's "
+        "subject, rendered in the reference's visual style. The reference's "
+        "specific subject/props/text content do NOT carry over — only the "
+        "design system does."
     )
     if len(analyses) > 1:
         bullets.append(
