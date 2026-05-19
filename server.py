@@ -436,7 +436,15 @@ For each rule from step 1, decide what stays vs. what adapts:
   • Surface content (specific subject, exact text wording, specific colors when they're tied to subject — e.g. red because danger) → ADAPTS to the user's new title.
 
 STEP 3 — WRITE THE OUTPUT.
-Output ONE polished image-generation prompt: a single natural-language paragraph, ~200–300 words, describing exactly what the new thumbnail looks like. Be vivid and concrete — describe subject(s), composition / layout (matching the reference's structural pattern), color palette (with named or hex specifics from the analysis), lighting (source, direction, quality, color temperature), text overlay (specific font weight, color, position, exact text content derived from the user's title — preserving the reference's overlay structure like headline + subhead), visual devices (arrows, tags, badges — preserve presence, adapt content), background, depth-of-field, micro-details, and quality markers. Use natural prose, not bullets. Do NOT use the words "reference", "template", "inspiration", or "YouTube" in the output. Output ONLY the final prompt — no preamble, no reasoning labels, no commentary."""
+Output ONE polished image-generation prompt: a single natural-language paragraph, ~200–300 words. The prompt will be sent to an image-generation model ALONGSIDE the reference image itself as a visual input — use BOTH channels efficiently:
+
+  • DESCRIBE EXPLICITLY (the prompt is the only signal for these): the new subject content; the composition / layout (the structural pattern the reference uses, applied to the new subject — what's where in the frame); the text overlay CONTENT (exact wording drawn from the user's title plus approximate position and the structure like headline + subhead); the visual devices the layout includes (arrows, price tags, badges, number labels — name what's there and what it says, e.g. "a red curved arrow pointing at X" / "a yellow price tag in the bottom-right reading $24").
+
+  • REFERENCE THE IMAGE for attributes that are hard or imprecise to verbalize — color palette, exact background tone, typography (font family, weight, treatment), textures (halftone, grain, paint, glow, gradient quality), lighting feel, the specific styling of any visual devices. Phrasing like "matching the halftone dot texture in the reference image", "using the same vibrant color palette as the reference image", "in the bold sans-serif title style of the reference image", "with the same hard, diffused lighting as the reference image" is GOOD — the image is literally attached to the call, so the model can look at it for those qualities.
+
+  • Heuristic: if you'd have to invent exact hex codes / font names / texture descriptions to put it in words, say "as in the reference image" instead. If you can describe it precisely in concrete prose (subject identity, layout pattern, what the text says), describe it.
+
+Use natural prose, not bullets. Do NOT use the words "template", "inspiration", or "YouTube" — but "reference image" IS okay (and useful) for the style-reference phrases described above. Output ONLY the final prompt — no preamble, no reasoning labels, no commentary."""
 
 
 def _map_reference_to_title_via_gemini(
@@ -1231,6 +1239,13 @@ def _build_mcp() -> FastMCP:
             # finds") which over-generalizes the semantic search and
             # surfaces off-topic outliers. Force the verbatim title here.
             search_query = (title or topic or "").strip()
+            # Fresh task invocation — clear any saved WIP for this title so
+            # the widget starts clean instead of restoring stale state from
+            # a prior chat session under the same title.
+            if title:
+                bucket = _load_state_bucket()
+                if bucket.pop(_state_key(title), None) is not None:
+                    _save_state_bucket(bucket)
             outliers, error = _fetch_outliers_from_algrow(
                 topic=search_query,
                 content_type=content_type,
@@ -1285,6 +1300,14 @@ def _build_mcp() -> FastMCP:
         user_title: Annotated[str | None, "The user's NEW video title — what THEIR thumbnail is for (different from the reference video's own title). Widget pre-fills its title field with this. Always pass when you have it."] = None,
     ) -> str:
         import json
+        # Fresh task invocation — clear any saved WIP for this title so the
+        # widget starts clean. Cross-device sync within one conversation
+        # still works because chat reopens replay cached tool results
+        # rather than re-firing this tool.
+        if user_title:
+            bucket = _load_state_bucket()
+            if bucket.pop(_state_key(user_title), None) is not None:
+                _save_state_bucket(bucket)
         info = extract_video_info(url_or_id)
         if not info.get("success"):
             return json.dumps({

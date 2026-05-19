@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -27,15 +28,50 @@ _MIME_BY_EXT = {
     ".webp": "image/webp",
 }
 
+# YouTube ID extractors (duplicated from server.py to avoid a circular
+# import — server.py imports gemini_image at module load).
+_YT_ID_FROM_ALGROW_RE = re.compile(
+    r"audio\.algrow\.online/thumbnails/(?:longform|shorts)/([A-Za-z0-9_-]{11})\."
+)
+_YT_ID_FROM_YTIMG_RE = re.compile(r"i\.ytimg\.com/vi(?:_webp)?/([A-Za-z0-9_-]{11})/")
+
+
+def _high_res_url_candidates(image_url: str) -> list[str]:
+    """Same upgrade strategy as the compose-side vision call: when the URL
+    is an algrow CDN preview (~168x94) or a YouTube hqdefault (480x360),
+    try maxresdefault → sddefault → hqdefault → original. Critical for
+    Gemini Image generation too — passing it a 168x94 reference is barely
+    informative, while passing 1280x720 gives Gemini real style signal.
+    """
+    candidates: list[str] = []
+    video_id: str | None = None
+    m = _YT_ID_FROM_ALGROW_RE.search(image_url)
+    if m:
+        video_id = m.group(1)
+    else:
+        m = _YT_ID_FROM_YTIMG_RE.search(image_url)
+        if m:
+            video_id = m.group(1)
+    if video_id:
+        candidates.append(f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg")
+        candidates.append(f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg")
+        candidates.append(f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
+    if image_url not in candidates:
+        candidates.append(image_url)
+    return candidates
+
 
 def _fetch_image_bytes(url: str) -> tuple[bytes, str] | None:
     """Download a reference image; returns (bytes, mime_type) or None.
 
-    Shortcut: if the URL points to our own /generated/ endpoint, read the
-    file off disk directly. Avoids an HTTP roundtrip through the public
-    tunnel (cloudflared → Cloudflare → back to us) when we already have
-    the file locally. Important for multi-turn editing where the previous
-    generation's image is passed as a reference for the next one.
+    Shortcut A — /generated/: if the URL points to our own /generated/
+    endpoint, read the file off disk directly. Avoids an HTTP roundtrip
+    through the public tunnel (cloudflared → Cloudflare → back to us)
+    on multi-turn editing.
+
+    Shortcut B — high-res upgrade: if the URL is an algrow CDN preview
+    or a YouTube hqdefault, walk the upgrade candidate chain (maxresdefault
+    first) so Gemini sees a usable resolution instead of a 168x94 blob.
     """
     if "/generated/" in url:
         fname = url.rsplit("/", 1)[-1].split("?", 1)[0]
@@ -47,16 +83,22 @@ def _fetch_image_bytes(url: str) -> tuple[bytes, str] | None:
             except Exception as e:
                 logger.warning(f"local /generated/ read failed for {fname}: {e}")
                 # fall through to HTTP fetch
-    try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        mime = (r.headers.get("content-type") or "image/jpeg").split(";")[0].strip()
-        if not mime.startswith("image/"):
-            mime = "image/jpeg"
-        return r.content, mime
-    except Exception as e:
-        logger.warning(f"reference fetch failed: {url}: {e}")
-        return None
+
+    last_err: str | None = None
+    for candidate in _high_res_url_candidates(url):
+        try:
+            r = requests.get(candidate, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            mime = (r.headers.get("content-type") or "image/jpeg").split(";")[0].strip()
+            if not mime.startswith("image/"):
+                mime = "image/jpeg"
+            logger.info(f"reference fetched for generation: {len(r.content)} bytes from {candidate}")
+            return r.content, mime
+        except Exception as e:
+            last_err = f"{candidate}: {str(e)[:120]}"
+            continue
+    logger.warning(f"reference fetch failed for all candidates of {url}: {last_err}")
+    return None
 
 
 def generate_image(
