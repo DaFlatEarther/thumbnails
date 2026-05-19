@@ -243,6 +243,43 @@
     .gen-loader-bar-fill, .gen-loader-bar-fill::after { animation: none; }
   }
 
+  /* Dino runner — playable while a generation is in flight. Sits under the
+     loader label, replaces itself with nothing when the loader is torn down
+     (innerHTML swap kills the canvas + listeners). */
+  .dino-wrap {
+    position: relative;
+    margin-top: 14px;
+    width: 100%;
+    max-width: 360px;
+  }
+  .dino-canvas {
+    width: 100%;
+    height: 100px;
+    display: block;
+    border-radius: 8px;
+    background: rgba(0,0,0,0.45);
+    border: 1px solid rgba(255,255,255,0.08);
+    cursor: pointer;
+    outline: none;
+  }
+  .dino-canvas:focus { border-color: var(--accent); }
+  .dino-hint {
+    margin-top: 6px;
+    font-size: 10.5px;
+    color: rgba(255,255,255,0.55);
+    text-align: center;
+    letter-spacing: 0.02em;
+  }
+  .dino-hint kbd {
+    background: rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 600;
+  }
+
   .meta {
     display: flex; gap: 10px; font-size: 12px; color: var(--sub);
     align-items: center; flex-wrap: wrap;
@@ -1152,9 +1189,171 @@ function loaderHtml(label, sub) {
         (label ? `<div class="gen-loader-label">${escape(label)}</div>` : "") +
         (sub ? `<div class="gen-loader-sub">${escape(sub)}</div>` : "") +
         '<div class="gen-loader-bar"><div class="gen-loader-bar-fill"></div></div>' +
+        '<div class="dino-wrap">' +
+          '<canvas class="dino-canvas" tabindex="0" aria-label="Dino runner mini-game"></canvas>' +
+          '<div class="dino-hint">Click to focus · <kbd>Space</kbd> jump · <kbd>R</kbd> restart</div>' +
+        '</div>' +
       '</div>' +
     '</div>'
   );
+}
+
+// Tiny canvas-based dinosaur runner. Wires itself up to the .dino-canvas
+// inside the active loader; auto-tears-down via MutationObserver when the
+// preview pane's innerHTML is swapped (which happens on success/fail).
+class DinoGame {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    // Match the canvas's CSS size at 2x DPR for crisp pixels.
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.floor(rect.width * dpr);
+    canvas.height = Math.floor(rect.height * dpr);
+    this.ctx.scale(dpr, dpr);
+    this.w = rect.width;
+    this.h = rect.height;
+    this.groundY = this.h - 16;
+    this.reset();
+    this.onKey = this.onKey.bind(this);
+    this.onPointer = this.onPointer.bind(this);
+    canvas.addEventListener("keydown", this.onKey);
+    canvas.addEventListener("pointerdown", this.onPointer);
+    this.raf = requestAnimationFrame(this.loop.bind(this));
+    this.alive = true;
+  }
+  reset() {
+    this.dino = { x: 28, y: 0, vy: 0, size: 18, grounded: true };
+    this.obstacles = [];
+    this.speed = 3.2;        // px/frame, ramps up
+    this.spawnCooldown = 60; // frames until next spawn
+    this.score = 0;
+    this.best = Math.max(this.best || 0, 0);
+    this.over = false;
+    this.started = false;
+  }
+  onPointer() { this.canvas.focus(); }
+  onKey(e) {
+    if (e.code === "Space" || e.code === "ArrowUp" || e.key === " ") {
+      e.preventDefault();
+      if (this.over) { this.reset(); return; }
+      if (!this.started) this.started = true;
+      if (this.dino.grounded) {
+        this.dino.vy = -9.5;
+        this.dino.grounded = false;
+      }
+    } else if (e.key === "r" || e.key === "R") {
+      e.preventDefault();
+      this.reset();
+    }
+  }
+  loop() {
+    if (!this.alive) return;
+    this.update();
+    this.draw();
+    this.raf = requestAnimationFrame(this.loop.bind(this));
+  }
+  update() {
+    if (!this.started || this.over) return;
+    // Dino physics.
+    this.dino.vy += 0.55;
+    this.dino.y += this.dino.vy;
+    if (this.dino.y >= 0) { this.dino.y = 0; this.dino.vy = 0; this.dino.grounded = true; }
+    // Obstacle motion.
+    for (const o of this.obstacles) o.x -= this.speed;
+    this.obstacles = this.obstacles.filter(o => o.x + o.w > -10);
+    // Spawn.
+    this.spawnCooldown--;
+    if (this.spawnCooldown <= 0) {
+      const h = 14 + Math.random() * 20;
+      this.obstacles.push({ x: this.w + 10, w: 10 + Math.random() * 8, h });
+      this.spawnCooldown = Math.floor(50 + Math.random() * 50);
+    }
+    // Speed ramp.
+    this.speed = Math.min(7.5, this.speed + 0.0025);
+    // Score + collision.
+    this.score++;
+    const d = this.dino;
+    const dx0 = d.x, dx1 = d.x + d.size;
+    const dy0 = this.groundY - d.size + d.y, dy1 = this.groundY + d.y;
+    for (const o of this.obstacles) {
+      const ox0 = o.x, ox1 = o.x + o.w;
+      const oy0 = this.groundY - o.h, oy1 = this.groundY;
+      if (dx1 > ox0 && dx0 < ox1 && dy1 > oy0 && dy0 < oy1) {
+        this.over = true;
+        this.best = Math.max(this.best, this.score);
+      }
+    }
+  }
+  draw() {
+    const c = this.ctx;
+    c.clearRect(0, 0, this.w, this.h);
+    // Ground line.
+    c.strokeStyle = "rgba(77, 156, 255, 0.45)";
+    c.lineWidth = 1;
+    c.beginPath();
+    c.moveTo(0, this.groundY + 0.5);
+    c.lineTo(this.w, this.groundY + 0.5);
+    c.stroke();
+    // Dino (cyan glow rect).
+    const d = this.dino;
+    c.fillStyle = "#4d9cff";
+    c.shadowColor = "rgba(77,156,255,0.7)";
+    c.shadowBlur = 8;
+    c.fillRect(d.x, this.groundY - d.size + d.y, d.size, d.size);
+    // Little leg tick to feel animated when running.
+    if (d.grounded && this.started && !this.over) {
+      const phase = Math.floor(this.score / 5) % 2 === 0 ? 0 : 3;
+      c.fillRect(d.x + 3, this.groundY + d.y, 4, 3 + phase);
+      c.fillRect(d.x + d.size - 7, this.groundY + d.y, 4, 6 - phase);
+    }
+    // Obstacles (orange).
+    c.fillStyle = "#ff6b35";
+    c.shadowColor = "rgba(255,107,53,0.6)";
+    for (const o of this.obstacles) {
+      c.fillRect(o.x, this.groundY - o.h, o.w, o.h);
+    }
+    c.shadowBlur = 0;
+    // Score / state text.
+    c.font = "600 11px DM Sans, sans-serif";
+    c.fillStyle = "rgba(255,255,255,0.85)";
+    c.textAlign = "right";
+    c.fillText(`${String(this.score).padStart(4, "0")}  HI ${String(this.best).padStart(4, "0")}`, this.w - 8, 14);
+    if (!this.started) {
+      c.textAlign = "center";
+      c.fillStyle = "rgba(255,255,255,0.7)";
+      c.fillText("press SPACE to start", this.w / 2, this.h / 2);
+    } else if (this.over) {
+      c.textAlign = "center";
+      c.fillStyle = "#ff6b6b";
+      c.fillText("GAME OVER  ·  R to restart", this.w / 2, this.h / 2);
+    }
+  }
+  destroy() {
+    this.alive = false;
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.canvas.removeEventListener("keydown", this.onKey);
+    this.canvas.removeEventListener("pointerdown", this.onPointer);
+  }
+}
+
+// Mount/teardown helper — watches the preview pane for innerHTML swaps so
+// the game cleans up itself when the loader is replaced by the image.
+let _activeDinoGame = null;
+function bootDinoIfPresent() {
+  if (_activeDinoGame) { _activeDinoGame.destroy(); _activeDinoGame = null; }
+  const canvas = preview?.querySelector(".dino-canvas");
+  if (canvas) {
+    // RAF defer so the canvas has its final layout size before we read it.
+    requestAnimationFrame(() => {
+      if (!preview.contains(canvas)) return;
+      _activeDinoGame = new DinoGame(canvas);
+    });
+  }
+}
+const _previewObserver = new MutationObserver(() => bootDinoIfPresent());
+if (typeof preview !== "undefined" && preview) {
+  _previewObserver.observe(preview, { childList: true, subtree: false });
 }
 
 function setLoading(state) {
