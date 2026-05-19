@@ -1045,11 +1045,16 @@ async function runAutoPipeline(app, ref, title) {
       composeData = text ? JSON.parse(text) : null;
     } catch (err) {
       _safeReplacePreview(`<div class="err">Compose failed: ${escape(err.message || String(err))}</div>`);
+      // Surface the failure in the compose-hint below the picker too —
+      // _safeReplacePreview is a no-op while the game is running, so
+      // without this the user would see an empty prompt and no clue why.
+      if (composeHint) composeHint.textContent = `Auto-compose failed: ${err.message || String(err)}. Click Create Prompt to retry.`;
       setLoading(false);
       return;
     }
     if (!composeData?.success || !composeData?.prompt) {
       _safeReplacePreview(`<div class="err">Compose returned no prompt: ${escape(composeData?.error || "unknown")}</div>`);
+      if (composeHint) composeHint.textContent = `Auto-compose returned no prompt: ${composeData?.error || "unknown"}. Click Create Prompt to retry.`;
       setLoading(false);
       return;
     }
@@ -1133,6 +1138,7 @@ function renderOutliers(payload) {
     if (!o.thumbnail_url) continue;
     const card = document.createElement("div");
     card.className = "outlier-card" + (isUrlInRefs(o.thumbnail_url) ? " selected" : "");
+    if (o.video_id) card.dataset.videoId = o.video_id;
     card.title = `${o.title || ""}\n${o.channel_name || ""}`;
     const viewsText = fmtViews(o.view_count);
     const score = fmtScore(o.outlier_score);
@@ -2215,16 +2221,25 @@ function render(payload, app, opts = {}) {
     if (payload.model && modelEl) { setDropdownValue(modelEl, payload.model); refreshModelHint(); }
 
     // Single-reference mode (user pasted a specific YouTube video) —
-    // auto-select that card so they skip the picking step.
+    // auto-select that card so they skip the picking step. Match by the
+    // outlier's video_id (stored on the card as data-video-id); matching
+    // by img.src is unreliable because the card uses a YouTube
+    // maxresdefault → hqdefault → stored-mirror fallback chain so the
+    // rendered src often disagrees with o.thumbnail_url.
     if (payload.single_reference && Array.isArray(payload.outliers) && payload.outliers.length === 1) {
       const o = payload.outliers[0];
       if (o?.thumbnail_url) {
         selectedOutlier = o;
         setSingleRefInUrls(o.thumbnail_url);
+        // single_reference always has exactly one card — mark it. The
+        // data-video-id selector is a defense-in-depth in case the picker
+        // gets re-rendered with multiple in some future code path.
         outliersGrid.querySelectorAll(".outlier-card").forEach((c) => {
-          const img = c.querySelector("img");
-          if (img && img.src === o.thumbnail_url) c.classList.add("selected");
+          if (!o.video_id || c.dataset.videoId === o.video_id) {
+            c.classList.add("selected");
+          }
         });
+        refreshComposeRow();  // sync hint + button now that selection landed
       }
     }
 
@@ -2277,11 +2292,9 @@ function render(payload, app, opts = {}) {
               && saved.selectedOutlier.thumbnail_url === currentRefUrl) {
             selectedOutlier = saved.selectedOutlier;
             setSingleRefInUrls(saved.selectedOutlier.thumbnail_url);
+            const vid = saved.selectedOutlier.video_id;
             outliersGrid.querySelectorAll(".outlier-card").forEach((c) => {
-              const img = c.querySelector("img");
-              if (img && img.src === saved.selectedOutlier.thumbnail_url) {
-                c.classList.add("selected");
-              }
+              if (vid && c.dataset.videoId === vid) c.classList.add("selected");
             });
           }
           if (saved.priorImageForReference) priorImageForReference = saved.priorImageForReference;
