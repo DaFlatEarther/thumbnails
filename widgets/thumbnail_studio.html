@@ -1000,9 +1000,7 @@ async function runAutoPipeline(app, ref, title) {
     // loader, which is wrong during this step (we're engineering the
     // prompt, not painting yet). Manually disable the Generate button so
     // the visible state still reflects "work in progress".
-    if (preview) {
-      preview.innerHTML = loaderHtml("Engineering prompt", "Analyzing your reference…");
-    }
+    if (preview) installLoader();
     generateBtn.disabled = true;
     generateBtn.textContent = "Generating…";
     let composeData = null;
@@ -1037,9 +1035,7 @@ async function runAutoPipeline(app, ref, title) {
     // Stage-2 placeholder and the subsequent polling loader read as one
     // continuous "Generating thumbnail" state, rather than a misleading
     // "Step 2/2 — Painting…" that hangs visible after the image arrives.
-    if (preview) {
-      preview.innerHTML = loaderHtml("Generating thumbnail", "Nano Banana Pro · usually 30–90s");
-    }
+    if (preview) installLoader();
     let genData = null;
     try {
       const res = await app.callServerTool({
@@ -1182,6 +1178,25 @@ function renderRefThumbs() {
     wrap.innerHTML = `<img src="${escape(u)}" referrerpolicy="no-referrer" alt=""><div class="badge">#${i + 1}</div>`;
     refThumbsEl.appendChild(wrap);
   });
+}
+
+// Idempotent loader install — only swap preview's innerHTML if the loader
+// isn't already showing. Polling and stage transitions can call this many
+// times per generation; without the guard, every call wipes the canvas and
+// resets the in-flight mini-game.
+function installLoader() {
+  if (!preview) return;
+  if (preview.querySelector(".gen-game")) {
+    // Loader already up; just refresh the corner overlay's model label so
+    // a Model dropdown change mid-flight reflects on screen.
+    const sub = preview.querySelectorAll(".gen-game-sub")[0];
+    if (sub && typeof MODEL_META !== "undefined") {
+      const m = MODEL_META[modelEl?.value] || MODEL_META["nano-banana-pro"];
+      if (m && sub.textContent !== m.label) sub.textContent = m.label;
+    }
+    return;
+  }
+  preview.innerHTML = loaderHtml();
 }
 
 function loaderHtml(label, sub) {
@@ -1743,7 +1758,7 @@ if (typeof preview !== "undefined" && preview) {
 
 function setLoading(state) {
   if (state) {
-    preview.innerHTML = loaderHtml("Generating thumbnail", "Nano Banana Pro · usually 30–90s");
+    installLoader();
     generateBtn.disabled = true;
     generateBtn.textContent = "Generating…";
   } else {
@@ -1956,12 +1971,7 @@ function render(payload, app, opts = {}) {
             render(p, app, { skipSave: true });
             return;
           }
-          if (preview) {
-            preview.innerHTML = loaderHtml(
-              "Generating thumbnail",
-              "Resuming previous run…"
-            );
-          }
+          if (preview) installLoader();
           return;
         }
         runAutoPipeline(app, payload.outliers[0], titleEl.value);
@@ -2095,7 +2105,7 @@ function render(payload, app, opts = {}) {
 
   // Generation in flight — show loader and start (or keep) polling.
   if (payload.state === "pending" && payload.task_id) {
-    preview.innerHTML = loaderHtml("Generating thumbnail", "Nano Banana Pro · usually 30–90s");
+    installLoader();
     meta.style.display = "none";
     setLoading(true);
     if (activePollTaskId !== payload.task_id) {
