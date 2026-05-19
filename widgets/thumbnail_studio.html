@@ -639,6 +639,18 @@
       </div>
       <input type="hidden" id="style-preset" value="person_focal">
     </div>
+    <div class="dropdown-wrapper" data-input-id="model" data-default-value="nano-banana-pro" title="Image-generation backend. Switch to a Seedream model if Nano Banana Pro keeps blocking on named people / brands.">
+      <button type="button" class="dropdown-btn">
+        <span class="dropdown-text">Nano Banana Pro</span>
+        <svg class="dropdown-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6,9 12,15 18,9"/></svg>
+      </button>
+      <div class="dropdown-menu">
+        <div class="dropdown-item" data-value="nano-banana-pro">Nano Banana Pro</div>
+        <div class="dropdown-item" data-value="seedream-4.5-edit">Seedream 4.5 Edit</div>
+        <div class="dropdown-item" data-value="seedream-5.0-lite">Seedream 5.0 Lite</div>
+      </div>
+      <input type="hidden" id="model" value="nano-banana-pro">
+    </div>
     <span style="flex:1;"></span>
     <button class="primary" id="generate">Generate</button>
   </div>
@@ -656,6 +668,7 @@ const promptEl = document.getElementById("prompt");
 const aspectEl = document.getElementById("aspect");
 const resolutionEl = document.getElementById("resolution");
 const stylePresetEl = document.getElementById("style-preset");
+const modelEl = document.getElementById("model");
 const generateBtn = document.getElementById("generate");
 const refToggle = document.getElementById("ref-toggle");
 const refBox = document.getElementById("ref-box");
@@ -738,6 +751,7 @@ async function saveStateNow() {
           lastSuccessPayload,
           priorImageForReference,
           stylePreset: stylePresetEl?.value,
+          model: modelEl?.value,
           aspectRatio: aspectEl?.value,
           resolution: resolutionEl?.value,
         },
@@ -942,6 +956,7 @@ async function runAutoPipeline(app, ref, title) {
           reference_urls: [ref.thumbnail_url],
           style_preset: "none",
           analyze_references: false,
+          model: modelEl?.value || "nano-banana-pro",
         },
       });
       const text = res?.content?.[0]?.text ?? "";
@@ -1397,6 +1412,7 @@ function render(payload, app, opts = {}) {
         });
       }
       if (saved.stylePreset && stylePresetEl) setDropdownValue(stylePresetEl, saved.stylePreset);
+      if (saved.model && modelEl) setDropdownValue(modelEl, saved.model);
       if (saved.aspectRatio && aspectEl) setDropdownValue(aspectEl, saved.aspectRatio);
       if (saved.resolution && resolutionEl) setDropdownValue(resolutionEl, saved.resolution);
       if (saved.priorImageForReference) priorImageForReference = saved.priorImageForReference;
@@ -1691,6 +1707,7 @@ function initDropdowns() {
     saveState();
   });
   stylePresetEl?.addEventListener("change", saveState);
+  modelEl?.addEventListener("change", saveState);
   aspectEl?.addEventListener("change", saveState);
   resolutionEl?.addEventListener("change", saveState);
 
@@ -1756,6 +1773,7 @@ function initDropdowns() {
         aspect_ratio: aspectEl.value,
         resolution: resolutionEl.value,
         style_preset: stylePresetEl?.value || "person_focal",
+        model: modelEl?.value || "nano-banana-pro",
       };
       const refs = parseRefUrls();
       // Multi-turn editing: if there's a previously-generated image, use

@@ -924,6 +924,7 @@ def _build_mcp() -> FastMCP:
         find_outliers_first: Annotated[bool, "Auto-pick path: fetch viral references from algrow and use the top 3 as reference_urls in the SAME call. ONLY set True when the user has explicitly opted into auto-pick (e.g. 'just pick a good reference for me', 'surprise me', 'don't make me choose'). Default UX is the two-step flow where the user picks ONE reference themselves — call find_outlier_references first for that, then call generate_thumbnail with the user's chosen reference_url. Use `outlier_topic` to keep the algrow search query short."] = False,
         outlier_topic: Annotated[str | None, "Topic to search algrow for when find_outliers_first=True. Defaults to `prompt` if unset, but keeping this short (2-3 words: 'Vietnam rail', 'Amazon Prime', 'Minecraft 100 days') gives much better outlier matches than a full prompt."] = None,
         analyze_references: Annotated[bool, "When True (default) AND reference_urls are provided, the server first runs Gemini vision on the references to extract a structured design breakdown (composition, palette, lighting, text style, etc.), then folds those template rules into the prompt. Result: Gemini's image-gen keeps the reference's design system but swaps the subject for the user's. Adds 5–15s of latency. Set False to skip and pass references as loose visual hints only."] = True,
+        model: Annotated[str, "Which image-generation backend to use:\n• 'nano-banana-pro' (DEFAULT) — Gemini 3 Pro Image direct. Highest quality, but its safety filter blocks named real people, recognizable brands, and references containing public figures (returns BlockedReason.OTHER).\n• 'seedream-4.5-edit' — Algrow proxy → Seedream 4.5 edit. Image-to-image, REQUIRES a reference. Different (more permissive) safety filter — use this when Nano Banana Pro keeps blocking on a biography / brand / public-figure thumbnail.\n• 'seedream-5.0-lite' — Algrow proxy → Seedream 5.0 lite. Text-to-image with optional reference. Faster than seedream-edit, also more permissive than Gemini direct.\nSwitch to a seedream model when the user hits a BlockedReason.OTHER on Nano Banana Pro and the reference / subject is a real person or brand."] = "nano-banana-pro",
     ) -> str:
         import json
 
@@ -971,17 +972,36 @@ def _build_mcp() -> FastMCP:
         else:
             composed_prompt = _compose_prompt(prompt, style_preset, ref_directives)
 
-        # Gemini's image API is synchronous — one POST returns the image
-        # bytes inline. No need for Kie's submit+poll dance. We save the
-        # bytes to /generated/<uuid>.png and hand the public URL to the
-        # widget so it can <img src=> immediately.
         import uuid as _uuid
-        gem = _gemini_generate_image(
-            prompt=composed_prompt,
-            reference_urls=resolved_refs or None,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
+
+        # Route to the right backend. Default is Gemini direct (highest
+        # quality, but a hard safety filter on named people/brands).
+        # Seedream variants go through algrow's proxy — separate filter,
+        # tolerates real-figure refs that Gemini blocks. The shape of the
+        # `gem` result is normalized so the rest of this function doesn't
+        # care which backend ran.
+        algrow_models = {"seedream-4.5-edit", "seedream-5.0-lite", "nano-banana-2"}
+        if model in algrow_models:
+            from algrow_image import generate_image as _algrow_generate_image
+            gem = _algrow_generate_image(
+                prompt=composed_prompt,
+                model=model,
+                aspect_ratio=aspect_ratio,
+                # algrow accepts one reference; pass the first if any.
+                reference_url=resolved_refs[0] if resolved_refs else None,
+            )
+            backend_label = f"algrow:{model}"
+        else:
+            # Gemini's image API is synchronous — one POST returns the
+            # image bytes inline. Save to /generated/<uuid>.png and hand
+            # the public URL to the widget so it can <img src=> immediately.
+            gem = _gemini_generate_image(
+                prompt=composed_prompt,
+                reference_urls=resolved_refs or None,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+            )
+            backend_label = "gemini-3-pro-image-preview"
 
         payload = {
             "prompt": prompt,
@@ -990,6 +1010,7 @@ def _build_mcp() -> FastMCP:
             "reference_urls": resolved_refs,
             "style_preset": style_preset,
             "outliers": outliers_list,
+            "model": model,
         }
         # Optional fields — only include when populated, so Claude doesn't
         # misread null keys as failure signals.
@@ -1004,29 +1025,32 @@ def _build_mcp() -> FastMCP:
             payload["reference_analysis_errors"] = ref_analysis_errors
 
         if gem.get("success"):
-            # Persist image to disk and build the public URL the widget will
-            # render. Filename is a UUID + the right extension derived from
-            # the mime type.
-            mt = gem.get("mime_type") or "image/png"
-            ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mt, ".png")
-            fname = f"{_uuid.uuid4().hex}{ext}"
-            (_GENERATED_DIR / fname).write_bytes(gem["image_bytes"])
-            # Build URL the widget can load. PUBLIC_BASE_URL lets you set
-            # the externally-visible host (the cloudflared tunnel) for the
-            # image link; defaults to a relative path so localhost dev works.
-            base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
-            image_url = f"{base}/generated/{fname}" if base else f"/generated/{fname}"
+            # Gemini returns raw bytes (we host them under /generated/);
+            # algrow returns a remote CDN URL (no bytes, already hosted).
+            # Either way the widget gets a single image URL.
+            if gem.get("image_bytes"):
+                mt = gem.get("mime_type") or "image/png"
+                ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mt, ".png")
+                fname = f"{_uuid.uuid4().hex}{ext}"
+                (_GENERATED_DIR / fname).write_bytes(gem["image_bytes"])
+                base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+                image_url = f"{base}/generated/{fname}" if base else f"/generated/{fname}"
+            else:
+                image_url = gem.get("image_url")
             payload.update({
                 "state": "success",
-                "images": [image_url],
-                "model": "gemini-3-pro-image-preview",
+                "images": [image_url] if image_url else [],
+                "backend": backend_label,
                 "cost_time_s": gem.get("cost_time_s"),
             })
+            if gem.get("credits_used") is not None:
+                payload["credits_used"] = gem["credits_used"]
         else:
             payload.update({
                 "state": "fail",
-                "error": _friendly_error(gem.get("error") or "Gemini image generation failed"),
+                "error": _friendly_error(gem.get("error") or f"{backend_label} image generation failed"),
                 "raw_error": gem.get("error"),
+                "backend": backend_label,
             })
         return json.dumps(payload, default=str)
 
