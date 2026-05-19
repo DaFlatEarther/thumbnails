@@ -977,32 +977,14 @@ def _build_mcp() -> FastMCP:
         # Route to the right backend. Default is Gemini direct (highest
         # quality, but a hard safety filter on named people/brands).
         # Seedream variants go through algrow's proxy — separate filter,
-        # tolerates real-figure refs that Gemini blocks. The shape of the
-        # `gem` result is normalized so the rest of this function doesn't
-        # care which backend ran.
+        # tolerates real-figure refs that Gemini blocks.
+        #
+        # IMPORTANT: algrow is async. We submit and return state=pending
+        # with the algrow job_id (prefixed `algrow:`); the widget polls
+        # check_thumbnail_status which routes the poll back to algrow.
+        # Doing a synchronous poll loop here blew claude.ai's ~60s MCP
+        # timeout for slower models (Seedream Edit can take 30-90s).
         algrow_models = {"seedream-4.5-edit", "seedream-5.0-lite", "nano-banana-2"}
-        if model in algrow_models:
-            from algrow_image import generate_image as _algrow_generate_image
-            gem = _algrow_generate_image(
-                prompt=composed_prompt,
-                model=model,
-                aspect_ratio=aspect_ratio,
-                # algrow accepts one reference; pass the first if any.
-                reference_url=resolved_refs[0] if resolved_refs else None,
-            )
-            backend_label = f"algrow:{model}"
-        else:
-            # Gemini's image API is synchronous — one POST returns the
-            # image bytes inline. Save to /generated/<uuid>.png and hand
-            # the public URL to the widget so it can <img src=> immediately.
-            gem = _gemini_generate_image(
-                prompt=composed_prompt,
-                reference_urls=resolved_refs or None,
-                aspect_ratio=aspect_ratio,
-                resolution=resolution,
-            )
-            backend_label = "gemini-3-pro-image-preview"
-
         payload = {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
@@ -1012,6 +994,44 @@ def _build_mcp() -> FastMCP:
             "outliers": outliers_list,
             "model": model,
         }
+        if model in algrow_models:
+            from algrow_image import submit_image as _algrow_submit
+            sub = _algrow_submit(
+                prompt=composed_prompt,
+                model=model,
+                aspect_ratio=aspect_ratio,
+                reference_url=resolved_refs[0] if resolved_refs else None,
+            )
+            topic_for_outliers = outlier_topic or (prompt if find_outliers_first else None)
+            if topic_for_outliers:
+                payload["outlier_topic"] = topic_for_outliers
+            if outlier_error:
+                payload["outlier_error"] = outlier_error
+            if sub.get("success"):
+                payload.update({
+                    "state": "pending",
+                    "task_id": sub["task_id"],
+                    "backend": f"algrow:{model}",
+                })
+                if sub.get("credits_used") is not None:
+                    payload["credits_used"] = sub["credits_used"]
+            else:
+                payload.update({
+                    "state": "fail",
+                    "error": _friendly_error(sub.get("error") or "Algrow submit failed."),
+                    "raw_error": sub.get("error"),
+                    "backend": f"algrow:{model}",
+                })
+            return json.dumps(payload, default=str)
+
+        # Gemini direct — synchronous, one POST returns image bytes inline.
+        gem = _gemini_generate_image(
+            prompt=composed_prompt,
+            reference_urls=resolved_refs or None,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+        )
+        backend_label = "gemini-3-pro-image-preview"
         # Optional fields — only include when populated, so Claude doesn't
         # misread null keys as failure signals.
         topic_for_outliers = outlier_topic or (prompt if find_outliers_first else None)
@@ -1073,10 +1093,10 @@ def _build_mcp() -> FastMCP:
         style_preset: Annotated[str, "Echoed back to the widget so the preset dropdown stays in sync across polls (otherwise the second poll wipes the value Claude originally chose)."] = "person_focal",
         outliers: Annotated[list[dict] | None, "Echoed back to the widget so the outlier grid persists across polling rounds. Widget sends this when the original generate_thumbnail call had find_outliers_first=True."] = None,
         outlier_topic: Annotated[str | None, "Echoed back; lets the widget keep the outlier-section header label."] = None,
+        model: Annotated[str, "Echoed back so the model dropdown stays in sync across polls."] = "nano-banana-pro",
     ) -> str:
         import json
 
-        status = query_task(task_id)
         payload = {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
@@ -1086,9 +1106,38 @@ def _build_mcp() -> FastMCP:
             "style_preset": style_preset,
             "outliers": outliers or [],
             "outlier_topic": outlier_topic,
+            "model": model,
         }
+
+        # Algrow tasks have a prefixed task_id; everything else is Kie.
+        from algrow_image import is_algrow_task_id, check_image_status as _algrow_check
+        if is_algrow_task_id(task_id):
+            ar = _algrow_check(task_id)
+            state = ar.get("state")
+            if state == "success":
+                payload.update({
+                    "state": "success",
+                    "images": [ar["image_url"]] if ar.get("image_url") else [],
+                    "backend": f"algrow:{model}",
+                })
+            elif state == "fail":
+                payload.update({
+                    "state": "fail",
+                    "error": _friendly_error(ar.get("error") or "Algrow generation failed"),
+                    "raw_error": ar.get("error"),
+                    "backend": f"algrow:{model}",
+                })
+            else:
+                payload["state"] = "pending"
+                if ar.get("transient_error"):
+                    payload["transient_error"] = ar["transient_error"]
+                if ar.get("upstream_state"):
+                    payload["upstream_state"] = ar["upstream_state"]
+            return json.dumps(payload, default=str)
+
+        # Legacy Kie path.
+        status = query_task(task_id)
         if not status.get("success"):
-            # Transient query error — keep widget in pending so it retries
             payload["state"] = "pending"
             payload["transient_error"] = status.get("error")
             return json.dumps(payload, default=str)

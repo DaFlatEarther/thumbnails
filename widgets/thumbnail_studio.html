@@ -1181,6 +1181,7 @@ function startPolling(taskId, app, opts) {
           style_preset: opts.style_preset || "person_focal",
           outliers: opts.outliers || [],
           outlier_topic: opts.outlier_topic || null,
+          model: opts.model || "nano-banana-pro",
         },
       });
       const text = res?.content?.[0]?.text ?? "";
@@ -1488,6 +1489,7 @@ function render(payload, app, opts = {}) {
         style_preset: payload.style_preset,
         outliers: payload.outliers,
         outlier_topic: payload.outlier_topic,
+        model: payload.model,
       });
     }
     // Persist the pending payload (including task_id + poll args) so a
