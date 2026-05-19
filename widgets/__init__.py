@@ -53,7 +53,7 @@ def load_widget_html(filename: str) -> str:
 # Widget registry — single thumbnail studio for now.
 # ---------------------------------------------------------------------------
 
-THUMBNAIL_STUDIO_URI = "ui://widgets/thumbnail-studio.html"
+THUMBNAIL_STUDIO_URI = "ui://widgets/thumbnail-studio-v2.html"
 
 # CSP allowlist for the iframe. We now serve generated images from this
 # server itself (under /generated/<uuid>.png), so PUBLIC_BASE_URL is added
@@ -87,6 +87,12 @@ THUMBNAIL_STUDIO_CSP = {
         # hotlink throttling). Without this on the allowlist the outlier
         # grid renders black boxes.
         "https://audio.algrow.online",
+        # Google Fonts — the widget loads DM Sans for the algrow-style card
+        # aesthetic. googleapis.com serves the stylesheet, gstatic.com
+        # serves the woff2 files. Without these the !important font-family
+        # rule still fires but resolves to the system fallback stack.
+        "https://fonts.googleapis.com",
+        "https://fonts.gstatic.com",
     ],
     "baseUriDomains": [],
 }

@@ -43,11 +43,33 @@ async function main() {
       thumbnail_url = `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`;
     }
 
+    // Channel avatar — basic_info doesn't expose it, so fetch the channel
+    // separately. Costs one extra Innertube round-trip (~200-400ms). If it
+    // fails for any reason we just return null so the main flow isn't
+    // blocked on what's a nice-to-have.
+    let channel_thumbnail = null;
+    const channelId = basic?.channel?.id || basic?.channel_id || null;
+    if (channelId) {
+      try {
+        const ch = await yt.getChannel(channelId);
+        const avatar = ch?.metadata?.thumbnail
+          || ch?.header?.author?.thumbnails
+          || [];
+        if (Array.isArray(avatar) && avatar.length) {
+          // Pick the largest avatar.
+          channel_thumbnail = avatar.reduce(
+            (a, b) => ((a?.width || 0) >= (b?.width || 0) ? a : b)
+          )?.url || null;
+        }
+      } catch (_) { /* swallow — channel pic is optional */ }
+    }
+
     console.log(JSON.stringify({
       success: true,
       video_id: id,
       title: basic.title || null,
       channel_name: basic.author || null,
+      channel_thumbnail,
       thumbnail_url,
       duration_s: basic.duration ?? null,
       view_count: basic.view_count ?? null,
