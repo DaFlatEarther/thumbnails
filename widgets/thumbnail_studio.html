@@ -639,15 +639,15 @@
       </div>
       <input type="hidden" id="style-preset" value="person_focal">
     </div>
-    <div class="dropdown-wrapper" data-input-id="model" data-default-value="nano-banana-pro" title="Image-generation backend. Switch to a Seedream model if Nano Banana Pro keeps blocking on named people / brands.">
+    <div class="dropdown-wrapper" data-input-id="model" data-default-value="nano-banana-pro" title="Image-generation backend. Lite regenerates a fresh image (use when blocked by Nano Banana Pro). Edit modifies the reference itself (preserves subject — use only for minor tweaks).">
       <button type="button" class="dropdown-btn">
         <span class="dropdown-text">Nano Banana Pro</span>
         <svg class="dropdown-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6,9 12,15 18,9"/></svg>
       </button>
       <div class="dropdown-menu">
-        <div class="dropdown-item" data-value="nano-banana-pro">Nano Banana Pro</div>
-        <div class="dropdown-item" data-value="seedream-4.5-edit">Seedream 4.5 Edit</div>
-        <div class="dropdown-item" data-value="seedream-5.0-lite">Seedream 5.0 Lite</div>
+        <div class="dropdown-item" data-value="nano-banana-pro">Nano Banana Pro (regenerate)</div>
+        <div class="dropdown-item" data-value="seedream-5.0-lite">Seedream 5.0 Lite (regenerate)</div>
+        <div class="dropdown-item" data-value="seedream-4.5-edit">Seedream 4.5 Edit (preserve subject)</div>
       </div>
       <input type="hidden" id="model" value="nano-banana-pro">
     </div>
