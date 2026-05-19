@@ -55,12 +55,19 @@ def load_widget_html(filename: str) -> str:
 
 THUMBNAIL_STUDIO_URI = "ui://widgets/thumbnail-studio.html"
 
-# CSP allowlist for the iframe. Nano Banana Pro returns image URLs hosted on
-# Kie's temporary file CDN — declare those origins so the <img src> loads.
+# CSP allowlist for the iframe. We now serve generated images from this
+# server itself (under /generated/<uuid>.png), so PUBLIC_BASE_URL is added
+# automatically when present. Kie's legacy CDNs are kept on the list for
+# back-compat in case anything is still referencing them, but the active
+# generation path is the official Gemini image API → local disk → /generated.
+import os as _os
+_PUBLIC_BASE_URL = (_os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
 THUMBNAIL_STUDIO_CSP = {
     "connectDomains": [],
     "resourceDomains": [
-        # Kie's image CDNs — where Gemini's generated thumbnails live.
+        # Where the official Gemini-generated image is served from.
+        *([_PUBLIC_BASE_URL] if _PUBLIC_BASE_URL else []),
+        # Legacy: Kie's image CDNs (no longer used by default).
         "https://tempfile.aiquickdraw.com",
         "https://file.aiquickdraw.com",
         "https://cdn.kie.ai",

@@ -24,3 +24,10 @@ dist/
 build/
 *.log
 generated/
+generated_images/
+
+# Node
+node_modules/
+
+# Runtime state — per-user WIP, not source
+widget_state.json

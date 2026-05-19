@@ -1,0 +1,9 @@
+{
+  "name": "thumbnails-yt-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "youtubei.js": "^15.0.0"
+  }
+}

@@ -197,6 +197,11 @@
   </div>
   <div class="meta" id="meta" style="display:none;"></div>
 
+  <div id="title-box" style="display:none; flex-direction:column; gap:4px; margin-bottom:8px;">
+    <label for="title" style="font-size:11px; color:var(--sub); text-transform:uppercase; letter-spacing:0.04em;">Title</label>
+    <input id="title" type="text" placeholder="What's the video / thumbnail about?" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--fg); font-size:13px;">
+  </div>
+
   <textarea id="prompt" placeholder="e.g. Cinematic close-up of a hooded figure in fog, neon highlights, dramatic lighting"></textarea>
 
   <div class="row" style="flex-wrap: wrap;">
@@ -213,6 +218,11 @@
       <button class="ref-toggle" id="outliers-close-btn" type="button">× Close</button>
     </div>
     <div class="outliers-grid" id="outliers-grid"></div>
+    <div id="compose-row" style="display:none; align-items:center; gap:8px; margin-top:8px;">
+      <span style="font-size:12px; color:var(--sub);" id="compose-hint">Pick a reference above, then engineer the prompt from it ↓</span>
+      <span style="flex:1;"></span>
+      <button class="primary" id="compose-btn" type="button" disabled>Create Prompt</button>
+    </div>
   </div>
 
   <div class="ref-box" id="ref-box" style="display:none;">
@@ -265,6 +275,101 @@ const outliersSection = document.getElementById("outliers-section");
 const outliersGrid = document.getElementById("outliers-grid");
 const outliersMeta = document.getElementById("outliers-meta");
 const outliersCloseBtn = document.getElementById("outliers-close-btn");
+const titleBox = document.getElementById("title-box");
+const titleEl = document.getElementById("title");
+const composeRow = document.getElementById("compose-row");
+const composeBtn = document.getElementById("compose-btn");
+const composeHint = document.getElementById("compose-hint");
+
+// True after the user clicked "Create Prompt" and the textarea was filled
+// with an engineered prompt. Tells the Generate handler to send the prompt
+// verbatim (style_preset='none', analyze_references=false) instead of
+// re-prepending the preset / re-running vision. Cleared as soon as the
+// user types into the prompt textarea — at that point we can't assume the
+// directives are still consistent with what they wrote.
+let promptIsComposed = false;
+
+// The full picked outlier object — URL + original video title + channel etc.
+// We pass the original title to compose_thumbnail_prompt so Gemini can
+// reason about WHY the reference's design choices fit its own title before
+// mapping them onto the user's new title. Without this, the mapping has no
+// semantic anchor — it just photocopies visuals.
+let selectedOutlier = null;
+
+// The latest tool-result payload we rendered (success or fail). Saved so
+// that when the widget re-mounts after a chat close/reopen, we can show
+// the user's last generation instead of dropping them back at the empty
+// picker. Updated by every render() that handles a result.
+let lastResultPayload = null;
+
+// Last successfully-generated image URL. Distinct from lastResultPayload
+// because that gets nulled when Claude pushes a refined prompt (so the
+// stale image doesn't haunt the preview pane), but we still want the
+// URL itself around so the NEXT Generate can use it as the reference —
+// multi-turn editing where the prior output is what Gemini modifies.
+let priorImageForReference = null;
+
+// Cross-device persistence — the server keeps a per-title JSON store and
+// the widget reads/writes it via callServerTool. claude.ai doesn't expose
+// a state API, but callServerTool from the widget is silent in the chat
+// (doesn't bloat Claude's context), so this costs zero conversational
+// tokens. Saves are debounced so we don't spam the server on every
+// keystroke. Loads happen async on mount and are applied progressively.
+
+let _appRef = null;  // captured during init so save/load helpers can call
+
+function _stateKey(title) {
+  return (title || "").trim().toLowerCase().slice(0, 200);
+}
+
+async function saveStateNow() {
+  if (!titleEl || !_appRef) return;
+  const key = _stateKey(titleEl.value);
+  if (!key) return;
+  try {
+    await _appRef.callServerTool({
+      name: "save_widget_state",
+      arguments: {
+        key,
+        state: {
+          title: titleEl.value || "",
+          prompt: promptEl?.value || "",
+          promptIsComposed,
+          selectedOutlier,
+          lastResultPayload,
+          priorImageForReference,
+          stylePreset: stylePresetEl?.value,
+          aspectRatio: aspectEl?.value,
+          resolution: resolutionEl?.value,
+        },
+      },
+    });
+  } catch (e) { /* network blip — drop silently */ }
+}
+
+let _saveTimer = null;
+function saveState() {
+  // Debounce ~700ms so a stream of keystrokes triggers one save.
+  if (_saveTimer) clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(saveStateNow, 700);
+}
+
+async function loadStateForTitleAsync(title) {
+  if (!_appRef) return null;
+  const key = _stateKey(title);
+  if (!key) return null;
+  try {
+    const res = await _appRef.callServerTool({
+      name: "load_widget_state",
+      arguments: { key },
+    });
+    const text = res?.content?.[0]?.text ?? "";
+    const data = text ? JSON.parse(text) : null;
+    return data?.state || null;
+  } catch (e) {
+    return null;
+  }
+}
 
 // Client-side mirror of the server's _resolve_reference_url. Used purely
 // to populate the live thumbnail preview row as the user types — the server
@@ -326,6 +431,23 @@ function toggleUrlInRefs(url) {
   return idx < 0;  // returns true if just added
 }
 
+// Single-select mode for the outlier picker — replaces whatever's in
+// reference_urls with just the clicked URL (or clears it if the same card
+// is clicked again). Lets the user commit to ONE reference cleanly rather
+// than accumulating picks.
+function setSingleRefInUrls(url) {
+  if (!url || !refUrlsEl) return false;
+  const current = (refUrlsEl.value || "").trim();
+  const isSame = current === url;
+  refUrlsEl.value = isSame ? "" : url;
+  if (!isSame && refBox) {
+    refBox.style.display = "flex";
+    if (refToggle) refToggle.textContent = "– Hide reference URLs";
+  }
+  renderRefThumbs();
+  return !isSame;  // true when newly selected, false when cleared
+}
+
 function renderOutliers(payload) {
   if (!outliersSection || !outliersGrid) return;
   const list = Array.isArray(payload?.outliers) ? payload.outliers : [];
@@ -358,10 +480,40 @@ function renderOutliers(payload) {
       <div class="caption">${escape(o.title || "")}</div>
     `;
     card.addEventListener("click", () => {
-      const added = toggleUrlInRefs(o.thumbnail_url);
-      card.classList.toggle("selected", added);
+      const added = setSingleRefInUrls(o.thumbnail_url);
+      // Clear .selected from every sibling card, then mark this one.
+      outliersGrid.querySelectorAll(".outlier-card.selected").forEach((c) => c.classList.remove("selected"));
+      if (added) {
+        card.classList.add("selected");
+        selectedOutlier = o;
+      } else {
+        selectedOutlier = null;
+      }
+      // A new reference invalidates any previously-composed prompt — the
+      // directives were keyed to the OLD reference's design analysis.
+      promptIsComposed = false;
+      refreshComposeRow();
+      saveState();
     });
     outliersGrid.appendChild(card);
+  }
+  refreshComposeRow();
+}
+
+// Show / hide / enable the "Create Prompt" button based on whether a card
+// is selected and whether the title is filled. Called whenever the picker
+// state changes.
+function refreshComposeRow() {
+  if (!composeRow || !composeBtn) return;
+  const hasSelection = !!outliersGrid?.querySelector(".outlier-card.selected");
+  const hasTitle = !!(titleEl?.value || "").trim();
+  const picker = outliersSection?.style.display === "flex";
+  composeRow.style.display = picker ? "flex" : "none";
+  composeBtn.disabled = !(hasSelection && hasTitle);
+  if (composeHint) {
+    if (!hasTitle) composeHint.textContent = "Enter a title above, then pick a reference and click Create Prompt.";
+    else if (!hasSelection) composeHint.textContent = "Pick one reference above, then click Create Prompt.";
+    else composeHint.textContent = "Ready — click Create Prompt to engineer the image-gen prompt.";
   }
 }
 
@@ -472,15 +624,98 @@ function render(payload, app, opts = {}) {
   // grid. Leave the preview pane alone (no image to render here) and let
   // the user pick references + then click Generate.
   if (payload.view === "outlier_picker") {
-    // If this is the first thing the widget sees, the preview pane will
-    // still show the initial "Type a prompt below…" hint, which is the
-    // right default. Just populate the topic into the prompt textarea if
-    // it's empty so the user can edit and generate from here.
-    if (payload.topic && !promptEl.value) {
-      promptEl.value = payload.topic;
-    }
+    // Show the title box and pre-fill it with the title Claude passed
+    // (falling back to the algrow search topic if no title — better than
+    // a blank field). The prompt textarea stays empty; the user fills it
+    // by clicking "Create Prompt" after picking a reference.
+    if (titleBox) titleBox.style.display = "flex";
+    const titleVal = payload.title || payload.topic || "";
+    if (titleEl && !titleEl.value) titleEl.value = titleVal;
     renderOutliers(payload);
+
+    // Single-reference mode (user pasted a specific YouTube video) —
+    // auto-select that card so they skip the picking step.
+    if (payload.single_reference && Array.isArray(payload.outliers) && payload.outliers.length === 1) {
+      const o = payload.outliers[0];
+      if (o?.thumbnail_url) {
+        selectedOutlier = o;
+        setSingleRefInUrls(o.thumbnail_url);
+        outliersGrid.querySelectorAll(".outlier-card").forEach((c) => {
+          const img = c.querySelector("img");
+          if (img && img.src === o.thumbnail_url) c.classList.add("selected");
+        });
+      }
+    }
+
+    // If the server pushed a refined_prompt (from set_widget_prompt /
+    // refine_thumbnail_prompt), drop it straight into the textarea and
+    // mark composed so the user can hit Generate immediately. Stash the
+    // prior generation's image URL into priorImageForReference (so the
+    // next Generate uses it as the reference for multi-turn editing),
+    // then clear lastResultPayload so the preview pane shows fresh canvas
+    // instead of the stale render.
+    if (payload.refined_prompt && promptEl) {
+      promptEl.value = payload.refined_prompt;
+      promptIsComposed = true;
+      if (lastResultPayload?.images?.[0]) {
+        priorImageForReference = lastResultPayload.images[0];
+      }
+      lastResultPayload = null;
+      saveState();
+    }
+
+    if (preview) {
+      if (payload.refined_prompt) {
+        preview.innerHTML = `<div class="empty">Prompt refined and ready below — review the changes, then click <b>Generate</b>.</div>`;
+      } else {
+        preview.innerHTML = payload.single_reference
+          ? `<div class="empty">Reference loaded.  Confirm the title above, then click <b>Create Prompt</b>, then <b>Generate</b>.</div>`
+          : `<div class="empty">1. Confirm the title above.  2. Pick a reference below.  3. Click <b>Create Prompt</b>.  4. Click <b>Generate</b>.</div>`;
+      }
+    }
+    refreshComposeRow();
     setLoading(false);
+
+    // Async restore from server — non-blocking. If a saved state for this
+    // title exists, apply it on top of the freshly-rendered picker. The
+    // user briefly sees the picker, then sees their prior WIP appear
+    // (selected card, composed prompt, last result).
+    //
+    // EXCEPTION: if this mount came with a refined_prompt, the user is
+    // explicitly starting a new generation — don't auto-restore a stale
+    // image into the preview pane. The new prompt is the "current state",
+    // not the previous result.
+    const skipResultRestore = !!payload.refined_prompt;
+    (async () => {
+      const saved = await loadStateForTitleAsync(titleEl?.value);
+      if (!saved) return;
+      if (saved.prompt && promptEl && !promptEl.value) {
+        promptEl.value = saved.prompt;
+        promptIsComposed = !!saved.promptIsComposed;
+      }
+      if (saved.selectedOutlier?.thumbnail_url) {
+        selectedOutlier = saved.selectedOutlier;
+        setSingleRefInUrls(saved.selectedOutlier.thumbnail_url);
+        outliersGrid.querySelectorAll(".outlier-card").forEach((c) => {
+          const img = c.querySelector("img");
+          if (img && img.src === saved.selectedOutlier.thumbnail_url) {
+            c.classList.add("selected");
+          }
+        });
+      }
+      if (saved.stylePreset && stylePresetEl) stylePresetEl.value = saved.stylePreset;
+      if (saved.aspectRatio && aspectEl) aspectEl.value = saved.aspectRatio;
+      if (saved.resolution && resolutionEl) resolutionEl.value = saved.resolution;
+      if (saved.priorImageForReference) priorImageForReference = saved.priorImageForReference;
+      refreshComposeRow();
+      if (skipResultRestore) return;
+      // If they had a successful or failed generation last time, re-render
+      // it instead of the "click a reference" hint. Skip pending state —
+      // the task_id is likely stale.
+      if (saved.lastResultPayload && saved.lastResultPayload.state !== "pending") {
+        render(saved.lastResultPayload, app, { skipSave: true });
+      }
+    })();
     return;
   }
   // Restore the prompt the user submitted so subsequent edits start from it.
@@ -548,6 +783,12 @@ function render(payload, app, opts = {}) {
     preview.innerHTML = `<div class="err">${escape(payload.error || "Generation failed")}</div>`;
     meta.style.display = "none";
     setLoading(false);
+    // Persist the failure too so reopening the chat doesn't silently drop
+    // the user back at the picker as if nothing happened.
+    if (!opts.skipSave) {
+      lastResultPayload = payload;
+      saveState();
+    }
     return;
   }
   const images = Array.isArray(payload.images) ? payload.images : [];
@@ -577,6 +818,12 @@ function render(payload, app, opts = {}) {
     });
   });
   setLoading(false);
+  // Persist successful generation so chat close/reopen restores the image
+  // instead of dropping the user back at the picker.
+  if (!opts.skipSave) {
+    lastResultPayload = payload;
+    saveState();
+  }
 }
 
 function applyHostContext(ctx) {
@@ -588,6 +835,7 @@ function applyHostContext(ctx) {
 
 (async () => {
   const app = new App({ name: "ThumbnailStudio", version: "1.0.0" }, {}, { autoResize: true });
+  _appRef = app;  // make available to save/load helpers
 
   app.ontoolresult = ({ content }) => {
     try {
@@ -659,6 +907,72 @@ function applyHostContext(ctx) {
     });
   }
 
+  // Title and prompt edits both invalidate state downstream. Title changes
+  // mean the engineered prompt (if any) is stale; prompt edits mean the
+  // user has rewritten the prompt themselves so we shouldn't treat it as
+  // a server-composed prompt anymore.
+  titleEl?.addEventListener("input", () => {
+    promptIsComposed = false;
+    refreshComposeRow();
+    saveState();
+  });
+  promptEl?.addEventListener("input", () => {
+    promptIsComposed = false;
+    saveState();
+  });
+  stylePresetEl?.addEventListener("change", saveState);
+  aspectEl?.addEventListener("change", saveState);
+  resolutionEl?.addEventListener("change", saveState);
+
+  composeBtn?.addEventListener("click", async () => {
+    const title = (titleEl?.value || "").trim();
+    const refs = parseRefUrls();
+    if (!title || !refs.length) {
+      refreshComposeRow();
+      return;
+    }
+    const originalLabel = composeBtn.textContent;
+    composeBtn.disabled = true;
+    composeBtn.textContent = "Composing…";
+    if (composeHint) composeHint.textContent = "Analyzing reference and engineering the prompt…";
+    try {
+      const composeArgs = {
+        title,
+        reference_url: refs[0],
+        style_preset: stylePresetEl?.value || "person_focal",
+      };
+      // Pass the reference's original title when we have it — gives the
+      // server-side mapping step a semantic anchor (why did THIS thumbnail
+      // work for THAT title?) before mapping to the user's NEW title.
+      if (selectedOutlier?.thumbnail_url === refs[0] && selectedOutlier?.title) {
+        composeArgs.reference_title = selectedOutlier.title;
+      }
+      const res = await app.callServerTool({
+        name: "compose_thumbnail_prompt",
+        arguments: composeArgs,
+      });
+      const text = res?.content?.[0]?.text ?? "";
+      const data = text ? JSON.parse(text) : null;
+      if (!data?.success || !data?.prompt) {
+        if (composeHint) composeHint.textContent = `Couldn't compose prompt: ${data?.error || data?.analysis_warning || "unknown error"}`;
+        composeBtn.disabled = false;
+        composeBtn.textContent = originalLabel;
+        return;
+      }
+      promptEl.value = data.prompt;
+      promptIsComposed = true;
+      if (composeHint) composeHint.textContent = "Prompt ready below. Review/edit if you want, then click Generate.";
+      composeBtn.textContent = "Recompose";
+      composeBtn.disabled = false;
+      // Pull the prompt textarea into view so it's obvious it got filled.
+      promptEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch (err) {
+      if (composeHint) composeHint.textContent = `Compose failed: ${escape(err.message || String(err))}`;
+      composeBtn.disabled = false;
+      composeBtn.textContent = originalLabel;
+    }
+  });
+
   generateBtn.addEventListener("click", async () => {
     const prompt = promptEl.value.trim();
     if (!prompt) {
@@ -674,7 +988,27 @@ function applyHostContext(ctx) {
         style_preset: stylePresetEl?.value || "person_focal",
       };
       const refs = parseRefUrls();
-      if (refs.length) args.reference_urls = refs;
+      // Multi-turn editing: if there's a previously-generated image, use
+      // THAT as the reference — the user is iterating on the output, so
+      // Gemini should edit the prior image rather than re-imagine from
+      // the original source-video thumbnail. Falls back to the picked
+      // reference for the first generation (no prior result yet).
+      // Check both: lastResultPayload (current in-memory result, before a
+      // refinement clears it) and priorImageForReference (stashed when
+      // a refinement clears the payload but the URL still matters).
+      const priorImage = lastResultPayload?.images?.[0] || priorImageForReference;
+      if (priorImage) {
+        args.reference_urls = [priorImage];
+      } else if (refs.length) {
+        args.reference_urls = refs;
+      }
+      // If the prompt was engineered server-side via compose_thumbnail_prompt,
+      // it already contains the preset rules + reference directives — send
+      // it verbatim so the server doesn't double-prepend.
+      if (promptIsComposed) {
+        args.style_preset = "none";
+        args.analyze_references = false;
+      }
 
       const res = await app.callServerTool({
         name: "generate_thumbnail",
