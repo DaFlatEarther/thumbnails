@@ -31,3 +31,8 @@ node_modules/
 
 # Runtime state — per-user WIP, not source
 widget_state.json
+
+# Local-only reference / scratch files
+.uvicorn.log
+.cloudflared.log
+layout
