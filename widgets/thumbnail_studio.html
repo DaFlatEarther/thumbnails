@@ -2756,11 +2756,22 @@ function initDropdowns() {
       // Check both: lastResultPayload (current in-memory result, before a
       // refinement clears it) and priorImageForReference (stashed when
       // a refinement clears the payload but the URL still matters).
-      const priorImage = lastResultPayload?.images?.[0] || priorImageForReference;
-      if (priorImage) {
-        args.reference_urls = [priorImage];
-      } else if (refs.length) {
+      // Reference priority: the user's picked reference (from the
+      // outlier picker / pasted URL) wins. We DON'T silently substitute
+      // the prior generated image — that caused "same image back 3
+      // times" because each new Generate was Gemini iterating on its
+      // own previous output, not regenerating from the original
+      // reference. Tight variants every round, even with rewritten
+      // prompts. If a user wants output-iteration ("make the eyes
+      // bigger"), they can paste the prior image URL into the refs
+      // textarea themselves.
+      if (refs.length) {
         args.reference_urls = refs;
+      } else if (lastResultPayload?.images?.[0] || priorImageForReference) {
+        // Fallback only when there's NO picked reference — keeps the
+        // legacy multi-turn-edit behavior for chats that came in
+        // without an explicit reference.
+        args.reference_urls = [lastResultPayload?.images?.[0] || priorImageForReference];
       }
       // If the prompt was engineered server-side via compose_thumbnail_prompt,
       // it already contains the preset rules + reference directives — send
