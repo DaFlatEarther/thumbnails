@@ -1284,7 +1284,8 @@ class DinoGame {
     this.clouds = [];
     this.ground = this._initialGround();
     this.over = false;
-    this.started = false;
+    this.started = true;   // autopilot needs the run already going so the
+                           // viewer sees motion without waiting for a key
     this.night = false;
     this.nightFlash = 0;   // animation timer for the day/night transition
     this.lastMilestone = 0;
@@ -1298,6 +1299,10 @@ class DinoGame {
       legPhase: 0,
     };
     this.holdDown = false;
+    // Autopilot defaults ON every fresh run. Any human key press flips it
+    // off and hands control to the player. R / restart re-enables it.
+    this.autopilot = true;
+    this.handoffFlash = 0;
   }
 
   _initialGround() {
@@ -1310,9 +1315,17 @@ class DinoGame {
     return arr;
   }
 
+  _humanTakeover() {
+    if (this.autopilot) {
+      this.autopilot = false;
+      this.handoffFlash = 90;  // ~1.5s of "you're driving" badge
+    }
+  }
+
   _onPointer(e) {
     this.wrap.focus({ preventScroll: true });
     // Tap-to-jump on mobile / casual click.
+    this._humanTakeover();
     this._handleJumpInput();
     e.preventDefault();
   }
@@ -1327,16 +1340,18 @@ class DinoGame {
 
     if (e.code === "Space" || e.code === "ArrowUp" || e.key === " ") {
       e.preventDefault();
+      this._humanTakeover();
       this._handleJumpInput();
     } else if (e.code === "ArrowDown") {
       e.preventDefault();
+      this._humanTakeover();
       this.holdDown = true;
       if (!this.over && this.dino.grounded && this.started) {
         this.dino.ducking = true;
       }
     } else if (e.key === "r" || e.key === "R") {
       e.preventDefault();
-      if (this.over) this.reset();
+      if (this.over) this.reset();  // restart re-enables autopilot via reset()
     }
   }
   _onKeyUp(e) {
@@ -1372,6 +1387,10 @@ class DinoGame {
       this._scrollGround(this.started ? this.speed : 0, dt);
       return;
     }
+    // Autopilot acts BEFORE physics so its jump command lands the same
+    // frame it decided to jump (no input-lag drift).
+    if (this.autopilot) this._aiThink();
+    if (this.handoffFlash > 0) this.handoffFlash -= dt;
     this.t += dt;
     // Speed ramp.
     this.speed = Math.min(13, this.speed + 0.002 * dt);
@@ -1450,6 +1469,77 @@ class DinoGame {
         }
         break;
       }
+    }
+  }
+
+  // Autopilot brain. Looks one obstacle ahead, computes the exact time-to-
+  // collision, and decides jump-vs-duck-vs-nothing. Aims for theoretical
+  // 100% accuracy: jump near the apex-overlap window so the dino crests
+  // right when the obstacle reaches it, duck only as long as the bird's
+  // hitbox overlaps. Constants are derived from this.speed so the AI
+  // self-tunes as the run gets faster.
+  _aiThink() {
+    const d = this.dino;
+    // Find the nearest obstacle we haven't passed yet.
+    let nearest = null;
+    for (const o of this.obstacles) {
+      if (o.x + o.w < d.x) continue;
+      if (!nearest || o.x < nearest.x) nearest = o;
+    }
+    // Nothing on screen — relax: stand up if we're crouched from a prior
+    // bird and the danger is gone.
+    if (!nearest) {
+      this.holdDown = false;
+      if (d.grounded) d.ducking = false;
+      return;
+    }
+    const distance = nearest.x - (d.x + 28);
+    const tToHit = distance / this.speed;  // frames until obstacle's leading edge reaches our trailing edge
+
+    if (nearest.kind === "cactus") {
+      // Jump physics: vy0 = -10.5, g = 0.6/frame → apex at ~17.5 frames,
+      // total airtime ≈ 35 frames. We want to be airborne when the obstacle
+      // overlaps our x. Trigger when time-to-hit is just under apex-time so
+      // we crest right over it. Window keeps us from jumping too early.
+      const APEX_T = 17.5;
+      if (d.grounded && tToHit > 0 && tToHit <= APEX_T) {
+        d.vy = -10.5;
+        d.grounded = false;
+        d.ducking = false;
+      }
+      // Don't hold duck near a cactus.
+      this.holdDown = false;
+      return;
+    }
+
+    if (nearest.kind === "bird") {
+      // Classify by altitude relative to ground line.
+      const dy = this.groundY - nearest.y;
+      const isLow = dy < 22;    // bird overlaps ducking dino if standing
+      const isMid = dy >= 22 && dy < 40;
+      const isHigh = dy >= 40;
+      // For low birds we must duck — start crouching ~10 frames before
+      // impact and hold until clear. For mid birds, ducking under is the
+      // safer choice (jumping risks clipping the wings). For high birds,
+      // do nothing — they pass above standing dino.
+      if (isLow || isMid) {
+        const enterT = 12, exitT = -3;  // duck window in frames-to-hit
+        const inWindow = tToHit <= enterT && tToHit >= exitT;
+        if (d.grounded) {
+          if (inWindow) {
+            d.ducking = true;
+            this.holdDown = true;
+          } else {
+            d.ducking = false;
+            this.holdDown = false;
+          }
+        }
+      } else if (isHigh) {
+        // Stay standing; ensure we're not still ducking from a prior bird.
+        this.holdDown = false;
+        if (d.grounded) d.ducking = false;
+      }
+      return;
     }
   }
 
@@ -1554,6 +1644,27 @@ class DinoGame {
     const renderScore = blink ? "" : scoreStr;
     const bestStr = this.best > 0 ? `HI ${String(this.best).padStart(5, "0")}  ` : "";
     c.fillText(`${bestStr}${renderScore}`, this.w - 16, 22);
+
+    // Drive-mode badge under the score: "AUTOPILOT" while AI plays,
+    // brief "YOU'RE PLAYING" flash for ~1.5s after handoff. Press SPACE
+    // to take over hint shows under AUTOPILOT after a brief delay.
+    c.font = "700 10px 'DM Sans', sans-serif";
+    c.textAlign = "right";
+    if (this.autopilot && this.started && !this.over) {
+      // Pulsing alpha to communicate "live AI"
+      const pulse = 0.6 + 0.35 * Math.sin(this.t * 0.12);
+      c.globalAlpha = pulse;
+      c.fillText("● AUTOPILOT", this.w - 16, 38);
+      c.globalAlpha = 0.6;
+      c.font = "500 9px 'DM Sans', sans-serif";
+      c.fillText("press SPACE to take over", this.w - 16, 51);
+      c.globalAlpha = 1;
+    } else if (this.handoffFlash > 0 && !this.over) {
+      const a = Math.min(1, this.handoffFlash / 30);
+      c.globalAlpha = a;
+      c.fillText("YOU'RE PLAYING", this.w - 16, 38);
+      c.globalAlpha = 1;
+    }
 
     // Game over banner.
     if (this.over) this._drawGameOver(fg);
