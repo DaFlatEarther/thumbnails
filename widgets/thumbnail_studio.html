@@ -1910,16 +1910,13 @@ let _activeDinoGame = null;
 // that finds the game already done) flushes it via performReveal().
 let _pendingThumbnail = null;
 
-// Returns true when the human is actively engaged in the game right now,
-// i.e. they took over from autopilot AND haven't crashed yet. Autopilot
-// runs don't count — those users are just watching the loader and want
-// to see the thumbnail the moment it lands.
-function _humanIsPlaying() {
+// Returns true when ANY game is running — AI or human. The thumbnail
+// reveal waits for the run to end either way; autopilot watchers should
+// also get to see the run finish naturally before the canvas disappears.
+function _gameIsRunning() {
   return !!(_activeDinoGame
     && _activeDinoGame.alive
-    && _activeDinoGame.started
-    && !_activeDinoGame.over
-    && !_activeDinoGame.autopilot);
+    && !_activeDinoGame.over);
 }
 
 // Park the result + update the corner overlay to "Thumbnail ready" so the
@@ -2011,7 +2008,7 @@ function performReveal(url, payload, app) {
 // Either reveal immediately (no engaged player) or park the result until
 // the player crashes. Called from every success path.
 function revealOrDeferImage(url, payload, app) {
-  if (_humanIsPlaying()) {
+  if (_gameIsRunning()) {
     _parkThumbnail(url, payload, app);
   } else {
     performReveal(url, payload, app);
