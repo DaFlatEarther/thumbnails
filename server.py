@@ -734,11 +734,11 @@ def _algrow_search_once(topic: str, content_type: str, limit: int,
                 "min_outlier_score": min_outlier_score,
                 "page": max(1, int(page)),
             },
-            timeout=90,
+            timeout=30,
         )
         data = resp.json() if resp.content else {}
     except requests.exceptions.Timeout:
-        return [], "Algrow timed out (>90s). Try a more specific topic.", 0, False
+        return [], "Algrow took too long (>30s). Try a different / shorter query, or retry.", 0, False
     except Exception as e:
         logger.warning(f"algrow API call failed: {e}")
         return [], _friendly_error(str(e)), 0, False
@@ -1508,6 +1508,12 @@ def _build_mcp() -> FastMCP:
             # finds") which over-generalizes the semantic search and
             # surfaces off-topic outliers. Force the verbatim title here.
             search_query = (title or topic or "").strip()
+            # Strip leading '@' — algrow's semantic search treats it as a
+            # literal token and returns 0 hits for channel handles like
+            # '@fern-tv'. The fallback chain eventually retries without it
+            # but that's two round-trips we don't need to pay for.
+            if search_query.startswith("@"):
+                search_query = search_query.lstrip("@").strip()
             # Fresh task invocation — clear any saved WIP for this title so
             # the widget starts clean instead of restoring stale state from
             # a prior chat session under the same title.
