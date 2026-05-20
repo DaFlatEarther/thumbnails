@@ -599,6 +599,54 @@
     gap: 14px;
   }
 
+  /* Pager — sits below the grid when there's more than one page. Matches
+     the rest of the dark-grey form controls (white-tinted, no accent
+     colour). */
+  .outliers-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    padding-top: 10px;
+  }
+  .outliers-pager.hidden { display: none; }
+  .outlier-pager-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    font-size: 18px;
+    line-height: 1;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background-color .15s ease, border-color .15s ease;
+    padding: 0;
+  }
+  .outlier-pager-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.22);
+  }
+  .outlier-pager-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+  }
+  .outlier-pager-btn svg {
+    width: 14px; height: 14px;
+  }
+  .outlier-pager-label {
+    color: var(--sub);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    min-width: 86px;
+    text-align: center;
+  }
+
   /* Empty-state block — renders inside the grid container when algrow
      returns zero. Centered icon + headline + suggestion chips the user
      can click to retry with a broader topic. Lives inside .outliers-grid
@@ -689,8 +737,7 @@
     box-shadow: 0 10px 24px rgba(0,0,0,0.5);
   }
   .outlier-card.selected {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent), 0 8px 20px rgba(77,156,255,0.35);
+    border-color: rgba(255, 255, 255, 0.35);
     background: var(--card-hi);
   }
   .outlier-card .thumb-wrap {
@@ -821,6 +868,15 @@
       <button class="ref-toggle" id="outliers-close-btn" type="button">× Close</button>
     </div>
     <div class="outliers-grid" id="outliers-grid"></div>
+    <div class="outliers-pager hidden" id="outliers-pager">
+      <button class="outlier-pager-btn" id="outlier-pager-prev" type="button" aria-label="Previous page" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+      <span class="outlier-pager-label" id="outlier-pager-label">Page 1 / 1</span>
+      <button class="outlier-pager-btn" id="outlier-pager-next" type="button" aria-label="Next page" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </button>
+    </div>
     <div id="compose-row" style="display:none; align-items:center; gap:8px; margin-top:4px;">
       <span class="hint" id="compose-hint">Pick a reference above, then engineer the prompt from it ↓</span>
       <span style="flex:1;"></span>
@@ -973,6 +1029,12 @@ function sandboxOutlierPickerMulti(topic) {
     { vid: "CIJ7PmGvYns", title: "Why This Watch Costs $50,000", channel: "Watch Lab", views: 980132, score: 4.6 },
     { vid: "SlEfdb6wvlE", title: "Kings Who Lost Their Minds", channel: "History Capsule", views: 458321, score: 3.1 },
     { vid: "bIEe29lh6_I", title: "How Time Becomes Space Inside a Black Hole", channel: "Cosmic", views: 712998, score: 5.2 },
+    { vid: "fT4zkqM6JSQ", title: "The Man Who Accidentally Saved Nintendo", channel: "Modern Ideas", views: 19559, score: 2.4 },
+    { vid: "a4KFGbW5iwI", title: "Inside The Worst Hotel In America", channel: "Decay Diaries", views: 822411, score: 4.1 },
+    { vid: "CIJ7PmGvYns", title: "Why Nobody Buys Subarus Anymore", channel: "Car Forensics", views: 612200, score: 3.4 },
+    { vid: "Rm-hSXCv5ko", title: "Every Lava Cake Recipe Tier List", channel: "Culinary Codex", views: 191002, score: 2.6 },
+    { vid: "OyKPASXUy48", title: "How A 17-Year-Old Built Snapchat", channel: "Founder Files", views: 358770, score: 3.5 },
+    { vid: "7zD0hGhMVqg", title: "Why Walmart Crushed Sears", channel: "Retail Wars", views: 444180, score: 2.85 },
   ];
   return {
     view: "outlier_picker",
@@ -1118,6 +1180,15 @@ const outliersGrid = document.getElementById("outliers-grid");
 const outliersMeta = document.getElementById("outliers-meta");
 const outliersSearchWrap = document.getElementById("outliers-search-wrap");
 const outliersSearchInput = document.getElementById("outliers-search-input");
+const outliersPager = document.getElementById("outliers-pager");
+const outlierPagerPrev = document.getElementById("outlier-pager-prev");
+const outlierPagerNext = document.getElementById("outlier-pager-next");
+const outlierPagerLabel = document.getElementById("outlier-pager-label");
+
+// Outlier pager state. Holds the full list so prev/next can re-render
+// the right slice without re-fetching. Reset on every fresh payload.
+const OUTLIER_PAGE_SIZE = 6;
+let _outlierPagerState = { list: [], page: 0, payload: null };
 const outliersCloseBtn = document.getElementById("outliers-close-btn");
 const titleBox = document.getElementById("title-box");
 const titleEl = document.getElementById("title");
@@ -1458,6 +1529,11 @@ function renderOutliers(payload) {
     }
     outliersSearchWrap.classList.remove("searching");
   }
+  // Hide pager whenever we're about to overwrite the grid with non-card
+  // content (error / empty); renderOutlierPage re-enables it for paginated
+  // result sets.
+  if (outliersPager) outliersPager.classList.add("hidden");
+
   if (payload?.error) {
     outliersGrid.innerHTML = `<div class="err" style="padding:6px;">${escape(payload.error)}</div>`;
     refreshComposeRow();
@@ -1525,9 +1601,28 @@ function renderOutliers(payload) {
     refreshComposeRow();
     return;
   }
+  // Stash the full list + payload in pager state, reset to page 0, and
+  // delegate the actual card-by-card render to renderOutlierPage().
+  _outlierPagerState.list = list.filter((o) => o && o.thumbnail_url);
+  _outlierPagerState.payload = payload;
+  _outlierPagerState.page = 0;
+  renderOutlierPage();
+}
+
+// Render the slice of _outlierPagerState.list belonging to the current
+// page. Also updates the pager controls (visibility + disabled state +
+// "Page X / Y" label) and re-runs refreshComposeRow.
+function renderOutlierPage() {
+  if (!outliersGrid) return;
+  const { list, page } = _outlierPagerState;
+  const totalPages = Math.max(1, Math.ceil(list.length / OUTLIER_PAGE_SIZE));
+  const clampedPage = Math.min(Math.max(0, page), totalPages - 1);
+  _outlierPagerState.page = clampedPage;
+  const start = clampedPage * OUTLIER_PAGE_SIZE;
+  const slice = list.slice(start, start + OUTLIER_PAGE_SIZE);
+
   outliersGrid.innerHTML = "";
-  for (const o of list) {
-    if (!o.thumbnail_url) continue;
+  for (const o of slice) {
     const card = document.createElement("div");
     card.className = "outlier-card" + (isUrlInRefs(o.thumbnail_url) ? " selected" : "");
     if (o.video_id) card.dataset.videoId = o.video_id;
@@ -1588,6 +1683,16 @@ function renderOutliers(payload) {
     });
     outliersGrid.appendChild(card);
   }
+
+  // Pager controls — hide entirely when there's only one page worth.
+  if (outliersPager) {
+    const showPager = list.length > OUTLIER_PAGE_SIZE;
+    outliersPager.classList.toggle("hidden", !showPager);
+    if (outlierPagerLabel) outlierPagerLabel.textContent = `Page ${clampedPage + 1} / ${totalPages}`;
+    if (outlierPagerPrev) outlierPagerPrev.disabled = clampedPage <= 0;
+    if (outlierPagerNext) outlierPagerNext.disabled = clampedPage >= totalPages - 1;
+  }
+
   refreshComposeRow();
 }
 
@@ -3029,6 +3134,24 @@ function initDropdowns() {
     outliersCloseBtn.addEventListener("click", () => {
       outliersSection.style.display = "none";
       outliersGrid.innerHTML = "";
+    });
+  }
+
+  // Pager arrows — page through _outlierPagerState.list in chunks of
+  // OUTLIER_PAGE_SIZE. Disabled state is toggled inside renderOutlierPage.
+  if (outlierPagerPrev) {
+    outlierPagerPrev.addEventListener("click", () => {
+      if (_outlierPagerState.page <= 0) return;
+      _outlierPagerState.page -= 1;
+      renderOutlierPage();
+    });
+  }
+  if (outlierPagerNext) {
+    outlierPagerNext.addEventListener("click", () => {
+      const last = Math.max(0, Math.ceil(_outlierPagerState.list.length / OUTLIER_PAGE_SIZE) - 1);
+      if (_outlierPagerState.page >= last) return;
+      _outlierPagerState.page += 1;
+      renderOutlierPage();
     });
   }
 

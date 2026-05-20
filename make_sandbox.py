@@ -103,6 +103,12 @@ function sandboxOutlierPickerMulti(topic) {
     { vid: "CIJ7PmGvYns", title: "Why This Watch Costs $50,000", channel: "Watch Lab", views: 980132, score: 4.6 },
     { vid: "SlEfdb6wvlE", title: "Kings Who Lost Their Minds", channel: "History Capsule", views: 458321, score: 3.1 },
     { vid: "bIEe29lh6_I", title: "How Time Becomes Space Inside a Black Hole", channel: "Cosmic", views: 712998, score: 5.2 },
+    { vid: "fT4zkqM6JSQ", title: "The Man Who Accidentally Saved Nintendo", channel: "Modern Ideas", views: 19559, score: 2.4 },
+    { vid: "a4KFGbW5iwI", title: "Inside The Worst Hotel In America", channel: "Decay Diaries", views: 822411, score: 4.1 },
+    { vid: "CIJ7PmGvYns", title: "Why Nobody Buys Subarus Anymore", channel: "Car Forensics", views: 612200, score: 3.4 },
+    { vid: "Rm-hSXCv5ko", title: "Every Lava Cake Recipe Tier List", channel: "Culinary Codex", views: 191002, score: 2.6 },
+    { vid: "OyKPASXUy48", title: "How A 17-Year-Old Built Snapchat", channel: "Founder Files", views: 358770, score: 3.5 },
+    { vid: "7zD0hGhMVqg", title: "Why Walmart Crushed Sears", channel: "Retail Wars", views: 444180, score: 2.85 },
   ];
   return {
     view: "outlier_picker",
