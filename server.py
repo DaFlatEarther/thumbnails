@@ -70,6 +70,18 @@ _GEMINI_TASKS: dict[str, dict] = {}
 # Soft cap so a long-running process doesn't grow this dict unbounded.
 _GEMINI_TASKS_MAX = 200
 
+# Same idea for algrow-backed models (gpt-image-2, seedream, nano-banana-2).
+# The algrow submit endpoint normally returns a job_id in <2s, but on Claude
+# mobile the MCP request timeout (<27s) sometimes fires before the submit
+# round-trips at all — the widget then sees "no response received" and the
+# user is stuck. Fire submit in a background task and return state=pending
+# with an `algrow_pending:<uuid>` placeholder; check_thumbnail_status reads
+# this dict, and once submit completes it transparently swaps in the real
+# algrow job_id for upstream polling.
+_ALGROW_SUBMIT_PREFIX = "algrow_pending:"
+_ALGROW_SUBMITS: dict[str, dict] = {}
+_ALGROW_SUBMITS_MAX = 200
+
 
 _STATE_FILE = Path(__file__).resolve().parent / "widget_state.json"
 _state_lock = threading.Lock()
@@ -1197,33 +1209,69 @@ def _build_mcp() -> FastMCP:
             "model": model,
         }
         if model in algrow_models:
-            from algrow_image import submit_image as _algrow_submit
-            sub = _algrow_submit(
-                prompt=composed_prompt,
-                model=model,
-                aspect_ratio=aspect_ratio,
-                reference_url=resolved_refs[0] if resolved_refs else None,
-            )
+            # Background-submit pattern (mirrors the Gemini direct path):
+            # the algrow submit POST is a blocking ~1-5s round-trip that has
+            # been timing out the Claude mobile MCP client mid-flight. Return
+            # state=pending with a placeholder task_id immediately and fire
+            # the submit in a background task; check_thumbnail_status reads
+            # _ALGROW_SUBMITS and transparently routes onto the real algrow
+            # job_id once submit completes.
+            placeholder = f"{_ALGROW_SUBMIT_PREFIX}{_uuid_top.uuid4().hex}"
+            _ALGROW_SUBMITS[placeholder] = {
+                "state": "submitting",
+                "started_at": time.time(),
+                "model": model,
+            }
+            if len(_ALGROW_SUBMITS) > _ALGROW_SUBMITS_MAX:
+                oldest = sorted(_ALGROW_SUBMITS.items(), key=lambda kv: kv[1].get("started_at", 0))
+                for k, _v in oldest[: len(_ALGROW_SUBMITS) - _ALGROW_SUBMITS_MAX]:
+                    _ALGROW_SUBMITS.pop(k, None)
+
+            ref_for_submit = resolved_refs[0] if resolved_refs else None
+            async def _run_algrow_submit():
+                try:
+                    from algrow_image import submit_image as _algrow_submit
+                    sub = await asyncio.to_thread(
+                        _algrow_submit,
+                        prompt=composed_prompt,
+                        model=model,
+                        aspect_ratio=aspect_ratio,
+                        reference_url=ref_for_submit,
+                    )
+                    if sub.get("success"):
+                        _ALGROW_SUBMITS[placeholder] = {
+                            "state": "submitted",
+                            "started_at": _ALGROW_SUBMITS.get(placeholder, {}).get("started_at", time.time()),
+                            "algrow_task_id": sub["task_id"],
+                            "credits_used": sub.get("credits_used"),
+                            "model": model,
+                        }
+                    else:
+                        _ALGROW_SUBMITS[placeholder] = {
+                            "state": "fail",
+                            "started_at": _ALGROW_SUBMITS.get(placeholder, {}).get("started_at", time.time()),
+                            "error": sub.get("error") or "Algrow submit failed.",
+                            "model": model,
+                        }
+                except Exception as e:
+                    _ALGROW_SUBMITS[placeholder] = {
+                        "state": "fail",
+                        "started_at": _ALGROW_SUBMITS.get(placeholder, {}).get("started_at", time.time()),
+                        "error": f"Algrow submit crashed: {e!r}"[:300],
+                        "model": model,
+                    }
+            asyncio.create_task(_run_algrow_submit())
+
             topic_for_outliers = outlier_topic or (prompt if find_outliers_first else None)
             if topic_for_outliers:
                 payload["outlier_topic"] = topic_for_outliers
             if outlier_error:
                 payload["outlier_error"] = outlier_error
-            if sub.get("success"):
-                payload.update({
-                    "state": "pending",
-                    "task_id": sub["task_id"],
-                    "backend": f"algrow:{model}",
-                })
-                if sub.get("credits_used") is not None:
-                    payload["credits_used"] = sub["credits_used"]
-            else:
-                payload.update({
-                    "state": "fail",
-                    "error": _friendly_error(sub.get("error") or "Algrow submit failed."),
-                    "raw_error": sub.get("error"),
-                    "backend": f"algrow:{model}",
-                })
+            payload.update({
+                "state": "pending",
+                "task_id": placeholder,
+                "backend": f"algrow:{model}",
+            })
             return json.dumps(payload, default=str)
 
         # Gemini direct — kick off the actual call in a background task so
@@ -1369,6 +1417,62 @@ def _build_mcp() -> FastMCP:
             return json.dumps(payload, default=str)
 
         from algrow_image import is_algrow_task_id, check_image_status as _algrow_check
+
+        # algrow_pending:<uuid> placeholder — set when generate_thumbnail
+        # backgrounded the algrow submit. Until that submit finishes we have
+        # nothing to poll upstream with; once it does, transparently route
+        # the poll onto the real algrow job_id so the widget never has to
+        # see the placeholder swap.
+        if task_id.startswith(_ALGROW_SUBMIT_PREFIX):
+            entry = _ALGROW_SUBMITS.get(task_id)
+            if not entry:
+                payload.update({
+                    "state": "fail",
+                    "error": "Server restarted while this generation was in flight — click Generate to retry.",
+                    "backend": f"algrow:{model}",
+                })
+                return json.dumps(payload, default=str)
+            state = entry.get("state")
+            if state == "submitting":
+                payload["state"] = "pending"
+                return json.dumps(payload, default=str)
+            if state == "fail":
+                payload.update({
+                    "state": "fail",
+                    "error": _friendly_error(entry.get("error") or "Algrow submit failed."),
+                    "raw_error": entry.get("error"),
+                    "backend": f"algrow:{entry.get('model') or model}",
+                })
+                return json.dumps(payload, default=str)
+            # state == "submitted" → fall through to algrow polling using the
+            # real job_id stashed by the background submit task.
+            algrow_task_id = entry["algrow_task_id"]
+            ar = _algrow_check(algrow_task_id)
+            ar_state = ar.get("state")
+            backend_label = f"algrow:{entry.get('model') or model}"
+            if ar_state == "success":
+                payload.update({
+                    "state": "success",
+                    "images": [ar["image_url"]] if ar.get("image_url") else [],
+                    "backend": backend_label,
+                })
+                if entry.get("credits_used") is not None:
+                    payload["credits_used"] = entry["credits_used"]
+            elif ar_state == "fail":
+                payload.update({
+                    "state": "fail",
+                    "error": _friendly_error(ar.get("error") or "Algrow generation failed"),
+                    "raw_error": ar.get("error"),
+                    "backend": backend_label,
+                })
+            else:
+                payload["state"] = "pending"
+                if ar.get("transient_error"):
+                    payload["transient_error"] = ar["transient_error"]
+                if ar.get("upstream_state"):
+                    payload["upstream_state"] = ar["upstream_state"]
+            return json.dumps(payload, default=str)
+
         if is_algrow_task_id(task_id):
             ar = _algrow_check(task_id)
             state = ar.get("state")
