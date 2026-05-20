@@ -581,17 +581,12 @@
     transition: opacity .15s ease;
   }
   .outliers-search input:focus ~ .outliers-search-hint { opacity: 1; }
-  .outliers-search.searching input { opacity: 0.7; cursor: progress; }
-  .outliers-search.searching::after {
-    content: "";
-    position: absolute;
-    right: 12px;
-    width: 12px; height: 12px;
-    border: 2px solid rgba(255,255,255,0.2);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite;
-  }
+  .outliers-search.searching input { cursor: progress; }
+  /* During a search, the central grid spinner is enough — hide the
+     in-input "ENTER ↵" hint chip so the user isn't being told to do
+     something they've already done. The mini spinner that used to sit
+     inside the input is gone for the same reason. */
+  .outliers-search.searching .outliers-search-hint { opacity: 0 !important; }
   .outliers-search.hidden { display: none; }
 
   .outliers-grid {
@@ -646,6 +641,10 @@
     padding-top: 10px;
   }
   .outliers-pager.hidden { display: none; }
+  /* While a search is in flight the grid is empty + showing the central
+     spinner — hide the pager too so "Page 4 / 4+" doesn't sit there
+     suggesting there's content to page through. */
+  .outliers-grid.searching ~ .outliers-pager { display: none !important; }
   .outlier-pager-btn {
     background: rgba(255, 255, 255, 0.05);
     border: 1px solid var(--line);
@@ -3264,7 +3263,7 @@ function initDropdowns() {
         if (!outliersGrid.querySelector(".outliers-search-overlay")) {
           const ov = document.createElement("div");
           ov.className = "outliers-search-overlay";
-          ov.innerHTML = '<span class="outliers-search-overlay-dot"></span><span class="outliers-search-overlay-label">Searching algrow outliers…</span>';
+          ov.innerHTML = '<span class="outliers-search-overlay-dot"></span><span class="outliers-search-overlay-label">Searching Algrow outliers…</span>';
           outliersGrid.appendChild(ov);
         }
       }
