@@ -528,6 +528,74 @@
     gap: 14px;
   }
 
+  /* Empty-state block — renders inside the grid container when algrow
+     returns zero. Centered icon + headline + suggestion chips the user
+     can click to retry with a broader topic. Lives inside .outliers-grid
+     so it doesn't break the grid's column flow; spans the full row. */
+  .outliers-empty {
+    grid-column: 1 / -1;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 8px;
+    padding: 32px 20px;
+    text-align: center;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px dashed var(--line);
+  }
+  .outliers-empty-icon {
+    font-size: 28px;
+    opacity: 0.45;
+    line-height: 1;
+    margin-bottom: 4px;
+  }
+  .outliers-empty-title {
+    color: var(--ink);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .outliers-empty-sub {
+    color: var(--sub);
+    font-size: 12.5px;
+    max-width: 380px;
+    line-height: 1.4;
+  }
+  .outliers-empty-suggest {
+    color: var(--sub);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+    margin-top: 8px;
+  }
+  .outliers-empty-chips {
+    display: flex; flex-wrap: wrap;
+    gap: 8px; justify-content: center;
+    margin-top: 2px;
+  }
+  .outliers-suggestion {
+    background: rgba(77, 156, 255, 0.1);
+    border: 1px solid rgba(77, 156, 255, 0.3);
+    color: var(--accent);
+    padding: 6px 14px;
+    border-radius: 100px;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color .15s ease, border-color .15s ease, transform .1s ease;
+  }
+  .outliers-suggestion:hover {
+    background: rgba(77, 156, 255, 0.18);
+    border-color: rgba(77, 156, 255, 0.55);
+    transform: translateY(-1px);
+  }
+  .outliers-suggestion:disabled {
+    opacity: 0.6;
+    cursor: progress;
+    transform: none;
+  }
+
   /* Viral-card style outlier — rounded thumb on top, meta block underneath,
      gradient outlier pill, hover lift. Mirrors the algrow viral discovery
      card layout. */
@@ -1127,10 +1195,69 @@ function renderOutliers(payload) {
   }
   if (payload?.error) {
     outliersGrid.innerHTML = `<div class="err" style="padding:6px;">${escape(payload.error)}</div>`;
+    refreshComposeRow();
     return;
   }
   if (!list.length) {
-    outliersGrid.innerHTML = `<div class="hint" style="padding:6px;">No outliers found for this topic. Try a broader phrase.</div>`;
+    // Empty state — show a centered card with suggested broader topics.
+    // The server already tried 3- and 2-word fallbacks; if THOSE also
+    // returned nothing the topic is genuinely thin in algrow's DB and
+    // we let the user pick from progressively narrower nouns. Suggestions
+    // never include the original topic the server just tried.
+    const original = (payload?.topic || "").trim();
+    const candidates = [];
+    [3, 2, 1].forEach((n) => {
+      const s = _shortenTopicJS(original, n);
+      if (s && s.toLowerCase() !== original.toLowerCase()
+          && !candidates.map((c) => c.toLowerCase()).includes(s.toLowerCase())) {
+        candidates.push(s);
+      }
+    });
+    const chipsHtml = candidates.length
+      ? `<div class="outliers-empty-suggest">Try a broader phrase</div>` +
+        `<div class="outliers-empty-chips">` +
+          candidates.map((c) => `<button class="outliers-suggestion" data-topic="${escape(c)}">${escape(c)}</button>`).join("") +
+        `</div>`
+      : "";
+    outliersGrid.innerHTML = `
+      <div class="outliers-empty">
+        <div class="outliers-empty-icon">📭</div>
+        <div class="outliers-empty-title">No matching references</div>
+        <div class="outliers-empty-sub">
+          ${original ? `Algrow's database doesn't have viral videos for <b>${escape(original)}</b>.` : "Algrow's database doesn't have viral videos for that query."}
+        </div>
+        ${chipsHtml}
+      </div>
+    `;
+    // Wire suggestion chips → re-fire find_outlier_references with the
+    // broader topic. Disables all chips while in-flight to avoid double-
+    // fires and provides clear "I'm working on it" feedback.
+    outliersGrid.querySelectorAll(".outliers-suggestion").forEach((chip) => {
+      chip.addEventListener("click", async () => {
+        const newTopic = chip.dataset.topic;
+        if (!newTopic || !_appRef) return;
+        const allChips = outliersGrid.querySelectorAll(".outliers-suggestion");
+        allChips.forEach((c) => { c.disabled = true; });
+        chip.textContent = `Searching "${newTopic}"…`;
+        try {
+          const res = await _appRef.callServerTool({
+            name: "find_outlier_references",
+            arguments: {
+              topic: newTopic,
+              title: titleEl?.value || undefined,
+              content_type: payload?.content_type || "longform",
+            },
+          });
+          const text = res?.content?.[0]?.text ?? "";
+          const data = text ? JSON.parse(text) : null;
+          if (data) renderOutliers(data);
+        } catch (err) {
+          chip.textContent = `Failed: ${(err?.message || String(err)).slice(0, 60)}`;
+          allChips.forEach((c) => { c.disabled = false; });
+        }
+      });
+    });
+    refreshComposeRow();
     return;
   }
   outliersGrid.innerHTML = "";
@@ -1202,12 +1329,37 @@ function renderOutliers(payload) {
 // Show / hide / enable the "Create Prompt" button based on whether a card
 // is selected and whether the title is filled. Called whenever the picker
 // state changes.
+// Mirror of server.py::_shorten_topic so the empty-state UI can render
+// the same fallback suggestions the server tried internally. Keep both
+// stopword sets in sync.
+const _TOPIC_STOPWORDS_JS = new Set([
+  "a","an","the","is","are","was","were","be","been","being",
+  "do","does","did","doing","have","has","had","having",
+  "how","what","why","when","where","which","who","whom","whose",
+  "of","in","on","at","to","for","with","by","from","into",
+  "inside","outside","about","as","and","or","but","if","then",
+  "this","that","these","those","it","its","they","them","their",
+  "you","your","we","our","i","me","my",
+  "really","actually","just","even","ever","always","never",
+  "can","could","should","would","may","might","must","shall","will",
+]);
+function _shortenTopicJS(topic, keep) {
+  const words = (topic || "").match(/[A-Za-z][A-Za-z0-9'\-]*/g) || [];
+  const sig = words.filter((w) => !_TOPIC_STOPWORDS_JS.has(w.toLowerCase()));
+  if (sig.length === 0) return "";
+  return sig.slice(-keep).join(" ");
+}
+
 function refreshComposeRow() {
   if (!composeRow || !composeBtn) return;
   const hasSelection = !!outliersGrid?.querySelector(".outlier-card.selected");
+  const hasAnyCards = !!outliersGrid?.querySelector(".outlier-card");
   const hasTitle = !!(titleEl?.value || "").trim();
   const picker = outliersSection?.style.display === "flex";
-  composeRow.style.display = picker ? "flex" : "none";
+  // Hide the compose row entirely when the picker is open but has no
+  // outlier cards (empty state). A "Create Prompt" button + "Pick one
+  // reference above" hint while no references exist is contradictory UX.
+  composeRow.style.display = (picker && hasAnyCards) ? "flex" : "none";
   composeBtn.disabled = !(hasSelection && hasTitle);
   if (composeHint) {
     if (!hasTitle) composeHint.textContent = "Enter a title above, then pick a reference and click Create Prompt.";
