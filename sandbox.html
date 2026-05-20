@@ -1002,6 +1002,11 @@
     <textarea id="prompt" placeholder="e.g. Cinematic close-up of a hooded figure in fog, neon highlights, dramatic lighting"></textarea>
   </div>
 
+  <div style="display:flex; flex-direction:column; gap:6px;">
+    <label class="label" for="custom-instructions">Custom Instructions <span class="hint" style="text-transform:none; letter-spacing:0; font-weight:500;">(optional — applied to every compose for this title)</span></label>
+    <textarea id="custom-instructions" style="min-height: 64px;" placeholder="e.g. Always 3 people, never just 1. Stick to a dark moody palette regardless of reference. Include the word EXPOSED in the corner."></textarea>
+  </div>
+
   <div class="row" style="flex-wrap: wrap;">
     <button class="ref-toggle" id="ref-toggle" type="button">+ Add reference images (URLs)</button>
     <span style="flex:1;"></span>
@@ -1039,6 +1044,11 @@
 
   <div class="ref-box" id="ref-box" style="display:none;">
     <textarea id="ref-urls" placeholder="One per line. Examples:&#10;https://youtube.com/watch?v=...&#10;https://youtu.be/...&#10;https://i.ytimg.com/vi/.../hqdefault.jpg&#10;https://example.com/style.png"></textarea>
+    <div class="row" style="flex-wrap: wrap; gap:8px; align-items:center;">
+      <button class="ref-toggle" id="ref-upload-btn" type="button">↑ Upload image</button>
+      <span class="hint" id="ref-upload-hint" style="text-transform:none; letter-spacing:0; font-weight:500;">PNG / JPG / WebP — max 12 MB</span>
+      <input type="file" id="ref-upload-input" accept="image/png,image/jpeg,image/webp,image/gif" style="display:none;">
+    </div>
     <div class="ref-thumbs" id="ref-thumbs"></div>
   </div>
 
@@ -1303,6 +1313,7 @@ const { App, applyHostStyleVariables } = globalThis.ExtApps;
 const preview = document.getElementById("preview");
 const meta = document.getElementById("meta");
 const promptEl = document.getElementById("prompt");
+const customInstructionsEl = document.getElementById("custom-instructions");
 const aspectEl = document.getElementById("aspect");
 const resolutionEl = document.getElementById("resolution");
 const stylePresetEl = document.getElementById("style-preset");
@@ -1445,6 +1456,7 @@ async function saveStateNow() {
         state: {
           title: titleEl.value || "",
           prompt: promptEl?.value || "",
+          customInstructions: customInstructionsEl?.value || "",
           promptIsComposed,
           selectedOutlier,
           lastResultPayload,
@@ -1620,6 +1632,7 @@ async function runAutoPipeline(app, ref, title) {
           reference_url: ref.thumbnail_url,
           reference_title: ref.title || undefined,
           style_preset: stylePreset,
+          custom_instructions: (customInstructionsEl?.value || "").trim() || undefined,
         },
       });
       const text = res?.content?.[0]?.text ?? "";
@@ -3047,6 +3060,9 @@ function render(payload, app, opts = {}) {
             promptIsComposed = !!saved.promptIsComposed;
             refreshGenerateBtn();
           }
+          if (saved.customInstructions && customInstructionsEl && !customInstructionsEl.value) {
+            customInstructionsEl.value = saved.customInstructions;
+          }
           if (saved.selectedOutlier?.thumbnail_url
               && saved.selectedOutlier.thumbnail_url === currentRefUrl) {
             selectedOutlier = saved.selectedOutlier;
@@ -3137,6 +3153,9 @@ function render(payload, app, opts = {}) {
         promptEl.value = saved.prompt;
         promptIsComposed = !!saved.promptIsComposed;
         refreshGenerateBtn();
+      }
+      if (saved.customInstructions && customInstructionsEl && !customInstructionsEl.value) {
+        customInstructionsEl.value = saved.customInstructions;
       }
       if (saved.selectedOutlier?.thumbnail_url) {
         selectedOutlier = saved.selectedOutlier;
@@ -3375,6 +3394,89 @@ function initDropdowns() {
     refUrlsEl.addEventListener("paste", () => setTimeout(renderRefThumbs, 0));
   }
 
+  // Custom instructions — debounced save so the value survives refresh.
+  if (customInstructionsEl) {
+    customInstructionsEl.addEventListener("input", saveState);
+  }
+
+  // Reference image upload — local file → base64 → server tool → URL appended
+  // to ref-urls textarea (deduped). Server writes to /generated/refs/<uuid>
+  // and Sam syncs that dir to R2 out-of-band, so the returned URL is a stable
+  // public URL we can hand to the model.
+  const refUploadBtn = document.getElementById("ref-upload-btn");
+  const refUploadInput = document.getElementById("ref-upload-input");
+  const refUploadHint = document.getElementById("ref-upload-hint");
+  const ALLOWED_UPLOAD_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+  const MAX_UPLOAD_BYTES = 12 * 1024 * 1024;
+  if (refUploadBtn && refUploadInput) {
+    refUploadBtn.addEventListener("click", () => refUploadInput.click());
+    refUploadInput.addEventListener("change", async () => {
+      const file = refUploadInput.files?.[0];
+      refUploadInput.value = "";  // allow re-selecting the same file later
+      if (!file) return;
+      if (!ALLOWED_UPLOAD_TYPES.has(file.type)) {
+        if (refUploadHint) refUploadHint.textContent = `Unsupported type: ${file.type || "unknown"}`;
+        return;
+      }
+      if (file.size > MAX_UPLOAD_BYTES) {
+        if (refUploadHint) refUploadHint.textContent = `File too large (${(file.size/1024/1024).toFixed(1)} MB > 12 MB)`;
+        return;
+      }
+      const origHint = refUploadHint?.textContent;
+      if (refUploadHint) refUploadHint.textContent = "Uploading…";
+      refUploadBtn.disabled = true;
+      try {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const fr = new FileReader();
+          fr.onload = () => resolve(fr.result);
+          fr.onerror = () => reject(fr.error || new Error("FileReader failed"));
+          fr.readAsDataURL(file);
+        });
+        // Strip the "data:<mime>;base64," prefix — server expects raw b64.
+        const b64 = String(dataUrl).split(",", 2)[1] || "";
+        const res = await _appRef.callServerTool({
+          name: "upload_reference_image",
+          arguments: {
+            image_b64: b64,
+            content_type: file.type,
+            filename_hint: file.name,
+          },
+        });
+        const text = res?.content?.[0]?.text ?? "";
+        const data = text ? JSON.parse(text) : null;
+        if (!data?.success || !data?.url) {
+          if (refUploadHint) refUploadHint.textContent = `Upload failed: ${data?.error || "unknown"}`;
+          return;
+        }
+        // Append URL to ref-urls textarea (dedupe), then re-render thumbs.
+        const existing = (refUrlsEl?.value || "").split("\n").map((l) => l.trim()).filter(Boolean);
+        if (!existing.includes(data.url)) existing.push(data.url);
+        refUrlsEl.value = existing.join("\n");
+        renderRefThumbs();
+        saveState();
+        if (refUploadHint) refUploadHint.textContent = "Uploaded ✓";
+        setTimeout(() => { if (refUploadHint) refUploadHint.textContent = origHint || ""; }, 2500);
+      } catch (err) {
+        if (refUploadHint) refUploadHint.textContent = `Upload failed: ${(err && err.message) || err}`;
+      } finally {
+        refUploadBtn.disabled = false;
+      }
+    });
+  }
+
+  // Mobile keyboards cover the bottom of the screen, so focusing a textbox
+  // below the viewport leaves it hidden behind the keyboard. Scroll it
+  // into view on focus. 300ms delay lets the OS finish opening the keyboard
+  // before measuring — without it the scroll lands in the wrong place.
+  document.addEventListener("focusin", (e) => {
+    const t = e.target;
+    if (!t || !(t instanceof Element)) return;
+    if (!t.matches("input, textarea")) return;
+    setTimeout(() => {
+      try { t.scrollIntoView({ block: "center", behavior: "smooth" }); } catch (_) {}
+    }, 300);
+  });
+
   if (outliersCloseBtn) {
     outliersCloseBtn.addEventListener("click", () => {
       outliersSection.style.display = "none";
@@ -3524,6 +3626,8 @@ function initDropdowns() {
         reference_url: refs[0],
         style_preset: stylePresetEl?.value || "person_focal",
       };
+      const customInstr = (customInstructionsEl?.value || "").trim();
+      if (customInstr) composeArgs.custom_instructions = customInstr;
       // Pass the reference's original title when we have it — gives the
       // server-side mapping step a semantic anchor (why did THIS thumbnail
       // work for THAT title?) before mapping to the user's NEW title.

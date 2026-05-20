@@ -47,6 +47,12 @@ load_dotenv()
 _GENERATED_DIR = Path(__file__).resolve().parent / "generated_images"
 _GENERATED_DIR.mkdir(exist_ok=True)
 
+# Where user-uploaded reference images land. Lives under generated_images
+# so the existing /generated static mount serves them too — no extra
+# Starlette route needed. Sam mirrors this directory to R2 out-of-band.
+_REFS_DIR = _GENERATED_DIR / "refs"
+_REFS_DIR.mkdir(exist_ok=True)
+
 # In-flight Gemini-direct generations. Keyed by task_id (prefixed with
 # "gemini:") so check_thumbnail_status can find them. Stored in process
 # memory — a uvicorn restart drops the dict, in which case status checks
@@ -562,6 +568,7 @@ def _map_reference_to_title_via_gemini(
     reference_url: str,
     reference_title: str | None,
     style_preset: str = "person_focal",
+    custom_instructions: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Single-call multimodal reasoning: Gemini sees the reference image +
     its original title + the user's new title, walks an enumerated visual
@@ -599,14 +606,32 @@ def _map_reference_to_title_via_gemini(
 
     reference_title_str = reference_title.strip() if reference_title else "(unknown — reason from the image alone)"
 
+    base_prompt = _REASONED_MAP_PROMPT.format(
+        title=title.strip(),
+        reference_title=reference_title_str,
+        style_hint=style_hint_text,
+    )
+    # Custom user-supplied directives go at the very END of the prompt so
+    # they have the highest salience and override the default rules where
+    # they conflict. Example use: "always show 3 people instead of 1",
+    # "stick to a dark/moody palette regardless of reference", "include
+    # the word EXPOSED in big red text in the corner". The instructions
+    # are user-authored, untrusted free text — wrapped in clear delimiters
+    # so they can't impersonate the system rules above.
+    if custom_instructions and custom_instructions.strip():
+        base_prompt += (
+            "\n\n═══════════════════════════════════════════════════════════════════════════\n"
+            "USER'S CUSTOM INSTRUCTIONS — apply these on top of every rule above.\n"
+            "Where these conflict with the default rules, follow these.\n"
+            "═══════════════════════════════════════════════════════════════════════════\n"
+            + custom_instructions.strip()
+            + "\n═══════════════════════════════════════════════════════════════════════════"
+        )
+
     body = {
         "contents": [{
             "parts": [
-                {"text": _REASONED_MAP_PROMPT.format(
-                    title=title.strip(),
-                    reference_title=reference_title_str,
-                    style_hint=style_hint_text,
-                )},
+                {"text": base_prompt},
                 {"inline_data": {"mime_type": mime_type, "data": _b64.b64encode(img_bytes).decode("ascii")}},
             ],
         }],
@@ -1448,6 +1473,7 @@ def _build_mcp() -> FastMCP:
             reference_url: Annotated[str, Field(description="The reference thumbnail URL the user picked. YouTube URLs / IDs / image URLs all accepted.")],
             reference_title: Annotated[str | None, Field(description="The ORIGINAL video title that the reference thumbnail was made for. PASS THIS whenever you have it (it comes back as `title` on each outlier from find_outlier_references). Without it, the mapping is forced to photocopy visuals; with it, Gemini can reason about WHY the reference's design choices fit ITS title before adapting that logic to the user's NEW title.")] = None,
             style_preset: Annotated[str, Field(description="person_focal | faceless | none. Default person_focal.")] = "person_focal",
+            custom_instructions: Annotated[str | None, Field(description="Optional free-text directives from the user that get appended to the compose prompt with highest salience (they override the default rules where they conflict). Use for sticky design preferences like 'always 3 people not 1', 'dark moody palette regardless of reference', 'include the word EXPOSED in the corner'. Driven by the widget's Custom Instructions textarea.")] = None,
         ) -> str:
             """Single-call reasoned compose:
               1. One multimodal Gemini call sees the reference image + its
@@ -1487,6 +1513,7 @@ def _build_mcp() -> FastMCP:
                 reference_url=resolved,
                 reference_title=reference_title,
                 style_preset=style_preset,
+                custom_instructions=custom_instructions,
             )
             if not mapped:
                 return json.dumps({
@@ -1890,6 +1917,60 @@ def _build_mcp() -> FastMCP:
             return json.dumps({"success": True, "state": None})
         bucket = _load_state_bucket()
         return json.dumps({"success": True, "state": bucket.get(k)})
+
+    @mcp.tool(
+        name="upload_reference_image",
+        title="Upload Reference Image (internal)",
+        description=(
+            "INTERNAL widget helper. The thumbnail-studio widget calls this "
+            "when the user drops or picks a local image file in the "
+            "References section. Saves the bytes under /generated/refs/ "
+            "with a UUID filename and returns a public URL the widget can "
+            "drop into the reference URLs list. Do NOT call from chat."
+        ),
+    )
+    async def upload_reference_image_tool(
+        image_b64: Annotated[str, Field(description="Base64-encoded image bytes (no data: prefix). Capped at ~12 MB decoded.")],
+        content_type: Annotated[str, Field(description="MIME type — image/png, image/jpeg, image/webp, image/gif.")] = "image/png",
+        filename_hint: Annotated[str | None, Field(description="Optional original filename for the suffix only — sanitized server-side. Default: derive extension from content_type.")] = None,
+    ) -> str:
+        import base64 as _b64
+        import json
+        import uuid as _uuid_loc
+
+        ALLOWED = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
+                   "image/webp": ".webp", "image/gif": ".gif"}
+        ct = (content_type or "").lower().strip()
+        if ct not in ALLOWED:
+            return json.dumps({"success": False, "error": f"Unsupported content_type: {ct or '(none)'}. Allowed: png, jpeg, webp, gif."})
+        # Strip optional data-URL prefix that browsers might leak through.
+        b64 = (image_b64 or "").strip()
+        if b64.startswith("data:"):
+            comma = b64.find(",")
+            if comma > 0:
+                b64 = b64[comma + 1:]
+        try:
+            raw = _b64.b64decode(b64, validate=True)
+        except Exception as e:
+            return json.dumps({"success": False, "error": f"Bad base64: {str(e)[:120]}"})
+        # 12 MB cap — Gemini Vision rejects anything bigger anyway.
+        if len(raw) > 12 * 1024 * 1024:
+            return json.dumps({"success": False, "error": f"Image too large ({len(raw):,} bytes). Max 12 MB."})
+        if len(raw) < 256:
+            return json.dumps({"success": False, "error": "Image too small / empty."})
+
+        ext = ALLOWED[ct]
+        fname = f"{_uuid_loc.uuid4().hex}{ext}"
+        try:
+            (_REFS_DIR / fname).write_bytes(raw)
+        except Exception as e:
+            logger.warning(f"upload_reference_image write failed: {e}")
+            return json.dumps({"success": False, "error": "Couldn't save upload."})
+        base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+        url = f"{base}/generated/refs/{fname}" if base else f"/generated/refs/{fname}"
+        logger.info(f"upload_reference_image saved {len(raw):,}B → {url}")
+        _ = filename_hint  # accepted for telemetry but not used for safety
+        return json.dumps({"success": True, "url": url, "bytes": len(raw), "content_type": ct})
 
     return mcp
 
