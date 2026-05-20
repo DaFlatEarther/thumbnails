@@ -53,7 +53,7 @@ def load_widget_html(filename: str) -> str:
 # Widget registry — single thumbnail studio for now.
 # ---------------------------------------------------------------------------
 
-THUMBNAIL_STUDIO_URI = "ui://widgets/thumbnail-studio-v30.html"
+THUMBNAIL_STUDIO_URI = "ui://widgets/thumbnail-studio-v31.html"
 
 # CSP allowlist for the iframe. We now serve generated images from this
 # server itself (under /generated/<uuid>.png), so PUBLIC_BASE_URL is added
