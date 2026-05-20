@@ -410,63 +410,77 @@ def _analyze_references_parallel(urls: list[str], max_n: int = 3
 # differ in kind, e.g. educational grid → on-camera face).
 # ---------------------------------------------------------------------------
 
-_REASONED_MAP_PROMPT = """You are writing an image-gen prompt for a brand-new YouTube thumbnail. You have a REFERENCE IMAGE attached for STYLE only. The output thumbnail must depict a COMPLETELY DIFFERENT SCENE from the reference — it should look like a fresh photograph / illustration that happens to share the reference's visual vibe.
+_REASONED_MAP_PROMPT = """You are an expert YouTube thumbnail designer. You will reason through WHY a reference thumbnail works for its original title, then transfer that same design logic to a NEW title — with the user's NEW SUBJECT swapped in for the reference's old subject.
 
-If a viewer saw your generated thumbnail next to the reference, they should immediately see TWO DIFFERENT SCENES that share a colour palette and lighting feel. They should NOT see "same image with the subject swapped".
+You have these inputs:
 
-INPUTS:
-  1. REFERENCE IMAGE — attached. Study it for style only.
-  2. REFERENCE TITLE: "{reference_title}"  (what THE REFERENCE was made for; you ignore this for content)
-  3. USER'S NEW TITLE: "{title}"  (what YOUR thumbnail is about; this drives content 100%)
+  1. REFERENCE IMAGE — attached.
+  2. REFERENCE TITLE (the original video this thumbnail was made for): "{reference_title}"
+  3. USER'S NEW TITLE (what we are designing for now): "{title}"
   4. Style hint about the user's video format: {style_hint}
 
-═══════════════════════════════════════════════════════════════════════════
-WHAT YOU TAKE FROM THE REFERENCE — STYLE ONLY
-═══════════════════════════════════════════════════════════════════════════
-✓ Colour palette (dominant colours + accents)
-✓ Lighting style (warm/cold, hard/soft, direction, contrast level)
-✓ Mood / tone (cinematic, gritty, glossy, eerie, playful, etc.)
-✓ Image medium (photo / illustration / CGI / mixed-media / oil-painting-style etc.)
-✓ Texture quality (film grain, halftone dots, painterly brush, clean digital, glossy CGI, etc.)
-✓ Typography character (font weight, treatment — serif vs sans, all-caps, outlined, drop-shadow — WITHOUT the reference's text words)
-✓ General density (busy/cluttered vs minimal)
+Before mapping, internally walk the reference image as a comprehensive visual checklist — do NOT emit this list, use it only to make sure your reasoning is thorough. The checklist (each item must be considered):
+  • meta: image quality, image type (photo / illustration / composite / etc).
+  • global_context: scene description, time of day, atmosphere, lighting (source, direction, quality, color temperature).
+  • color_palette: dominant colors (named + approximate hexes if confident), accent colors, contrast level.
+  • composition: camera angle, framing, depth of field, focal point.
+  • objects: every distinct object, its category (Person / Animal / Vehicle / Furniture / Text / Symbol / etc.), location (top-left/center/etc), prominence (foreground/midground/background), color, texture, material, state, relative size, pose/orientation, any text on it.
+  • text_ocr: every visible text element, exact wording, font style (serif / sans / display / handwritten / bold / italic / condensed), location, legibility.
+  • semantic_relationships: who/what is holding, obscuring, supporting, casting shadow on, visually echoing what.
+  • visual devices: arrows, circles, strikethroughs, price tags, badges, glow effects, comic-panel borders, etc.
 
 ═══════════════════════════════════════════════════════════════════════════
-WHAT YOU DO NOT TAKE FROM THE REFERENCE — INVENT FRESH
-═══════════════════════════════════════════════════════════════════════════
-✗ The reference's specific person / animal / building / vehicle / object
-✗ The reference's pose, gesture, facial expression
-✗ The reference's setting / location / background contents
-✗ The reference's props, accessories, costume
-✗ The reference's text words (use the user's title to derive new text)
-✗ The reference's exact composition / layout — DO NOT describe "hero on the left, text on the right" by echoing the reference's coordinates. At most say "a centred portrait" or "a wide establishing shot"; let the image model arrange the new content.
-✗ Any pixel-level layout match. If the reference happens to have an arrow at coordinate X, your prompt does NOT mention "an arrow at coordinate X" — that's how asset-copying happens.
-
-EVERYTHING IN THE LEFT (CONTENT) COLUMN COMES FROM THE USER'S TITLE.
-
-═══════════════════════════════════════════════════════════════════════════
-HOW TO COMPOSE THE NEW SUBJECT
-═══════════════════════════════════════════════════════════════════════════
-The user's title tells you the SUBJECT. Write a concrete, specific description that depicts THIS subject in a scene that fits THIS title:
-
-  • If the title implies a person → describe their physical look (age range, build, ethnicity-as-fits-title, hair, clothing-period, expression that narrates the title's verb).
-  • If the title implies an object → describe its silhouette, materials, colours, period.
-  • If the title implies a place → describe the setting cues (era, atmosphere, props that signal the location).
-  • If the title implies a verb / action → describe the matching gesture or moment.
-
-The new subject must differ from the reference's subject on at least TWO axes (ethnicity, era, action, setting, props, medium). Vague descriptors like "an older man" let the reference's identity bleed through; specific descriptors push the image model toward a fresh render.
-
-═══════════════════════════════════════════════════════════════════════════
-HARD RULES
+HARD RULES — these override everything else, including the style hint:
 ═══════════════════════════════════════════════════════════════════════════
 
-RULE 1 — PERSON COUNT MATCHES THE REFERENCE.
-If the reference shows no people, the output shows no people. If the reference shows one person, the output shows one person (whose identity comes from the new title, not from the reference). If the reference shows a group, the output shows a group (sized similarly, but freshly composed for the new title).
+CORE PRINCIPLE — TRANSFER THE DESIGN GRAMMAR, NOT THE SURFACE FORM.
+The reference thumbnail is one specific instance of a design grammar that worked for THE REFERENCE'S TITLE. The reference's designer made a SEQUENCE of choices: who is in frame, what they're doing, where they are, what props are around them, what the text says, what the visual device points at. Each of those choices was made because it fit the REFERENCE'S subject.
 
-RULE 2 — DON'T DESCRIBE LAYOUT IN COORDINATES.
-NEVER write "in the same position as the reference image", "matching the reference's composition", "where the [reference object] is in the reference, put [new object]". That bakes the reference's pixel layout into your prompt and the image model will just relabel. At most say "a centred chest-up portrait", "an over-the-shoulder shot", "a wide establishing shot" — leave the actual layout to the model.
+Your job is NOT to copy those specific choices. Your job is to identify the DESIGN GRAMMAR (the slots, the relationships, the visual language) and then make a NEW set of choices — each one driven by the USER'S TITLE — that fills the same grammar.
 
-RULE 3 — DON'T NAME REAL PEOPLE OR REAL BRANDS. DESCRIBE THEM PHYSICALLY INSTEAD.
+If the reference shows a Japanese founder mid-gesture in a 1980s tech-office setting, that grammar is:
+  [hero portrait slot] = "the iconic figure most associated with the title's subject"
+  [pose slot]          = "a gesture that visually narrates the title's main verb / claim"
+  [setting slot]       = "an instantly-readable environment that signals the title's domain"
+  [text slot]          = "a punchy label that gives the visual its narrative hook"
+  [visual device slot] = "an arrow / callout that directs attention to the hero"
+
+For a McDonald's title, the SAME grammar fills differently:
+  hero      → an iconic American business-pitch figure (mid-century salesman archetype)
+  pose      → a confident sell / presentation gesture
+  setting   → a vintage American fast-food environment
+  text      → a hook word/phrase fitting McDonald's story
+  device    → the same arrow / callout pattern
+
+The grammar transfers verbatim. The fillings DO NOT.
+
+RULE 1 — THE REFERENCE'S COMPOSITIONAL SLOTS TRANSFER. THE FILLINGS DON'T.
+Identify the slots: where is the hero in frame, what's behind them, where's the text, where's the visual device. THOSE structural positions transfer. The specific CONTENTS of each slot (which person, which pose, which background props, which words) get re-chosen from the user's new title.
+
+You do not copy the reference's pose at the limb / finger level. You do not copy the reference's person at the ethnicity / hairstyle level. You CHOOSE new limb positions and new physical descriptors that fit the user's title.
+
+RULE 2 — IF THE REFERENCE HAS NO PERSON, THE OUTPUT HAS NO PERSON.
+Check `objects` in the analysis. If none have `category: "Person"`, do NOT include a person, creator, model, or any human figure in the output, even if the style hint says "person_focal". The style hint is about the USER'S VIDEO format, not a license to inject characters that aren't in the reference's design pattern. If the reference is faceless and the user's video happens to have a creator on camera, the user is choosing to use a faceless thumbnail style — that's a deliberate choice signaled by their reference pick.
+
+RULE 3 — IF THE REFERENCE HAS A PERSON, KEEP A PERSON — BUT CHOOSE WHO + HOW BASED ON THE USER'S TITLE.
+The reference has a person → the output has a person. But:
+  • The PERSON'S identity (ethnicity, age range, hair, clothing, period dress) is derived from the USER'S TITLE, not transferred from the reference.
+    - Reference is about a Japanese company → reference's person is Japanese. User's title is about an American company → output person is American-looking.
+    - Reference is about a 1980s figure → reference's clothing fits 1980s. User's title is about a 1950s figure → output clothing fits 1950s.
+  • The POSE is derived from the USER'S TITLE'S meaning, not transferred from the reference.
+    - Reference shows "explaining" because the reference title is about teaching/revelation. User's title is about salesmanship → pose is a confident sell / pitch gesture, not the explaining pose.
+    - Reference shows "shock" because the reference title is about a twist. User's title is about quiet competence → pose is composed, not shocked.
+  • The EXPRESSION follows the same rule — chosen to match the user's title's tone.
+
+The framing position (e.g. "centered, chest-up close-up", "left-third, full-body") is structural and transfers. WHAT they look like and WHAT they're doing is re-chosen.
+
+RULE 4 — STRUCTURAL ELEMENTS THE REFERENCE USES MUST BE PRESERVED — WITH NEW FILLINGS:
+  • Text overlays — same number, same approximate positions, same font style/weight, same colors. The TEXT CONTENT itself is rewritten to fit the user's new title (same hook style, e.g. "ONLY EXPERTS KNOW!" with a parenthetical subhead → adapt the same hook + subhead format for the new title).
+  • Visual devices — arrows, circles, strikethroughs, price tags, badges. If the reference has a red curved arrow, the output has a red curved arrow. The device's TARGET adapts (it points at the new hero, not the same point in space).
+  • Background TYPE adapts to the user's title's domain. Reference has a "luxury boutique blurred background" because the reference is about luxury → keep blurred + similar lighting/palette/depth-of-field, but change the SETTING (e.g. for a fast-food title → a blurred 1960s diner interior with similar lighting feel and similar warmth).
+  • Lighting STYLE transfers (warm vs cold, hard vs diffused, high-key vs low-key). The lighting's COLOR / temperature may shift slightly to suit the new setting.
+
+RULE 5 — NEVER NAME REAL PEOPLE OR REAL BRANDS. DESCRIBE THEM PHYSICALLY INSTEAD.
 The downstream image model's safety filter blocks generations that name real public figures or brand names (it returns BlockedReason.OTHER and the user gets nothing). To produce reliable renders, you must NEVER write the name of a real person or a real brand in the output prompt — even when the user's title is explicitly about that person or brand.
 
   • PEOPLE: Do not write names like "Ray Kroc", "Tom Cruise", "Beyoncé", "Elon Musk", "Pope Francis", "Yutaka Urakami". Instead, describe the person via concrete physical attributes the image generator can render: approximate age, ethnicity / nationality cues, build, hair color and style, complexion, facial features, signature clothing or accessories, characteristic expression or pose.
@@ -489,35 +503,58 @@ The downstream image model's safety filter blocks generations that name real pub
 
   • The level of specificity should still match the title. If the title implies a specific category, describe a specific-LOOKING instance of that category in detail. NEVER write vague placeholders like "a celebrity-looking person" or "a famous-looking face" — those tell the image model nothing.
 
+RULE 6 — RE-FILL EACH SLOT FROM THE USER'S TITLE. NEVER TRANSFER THE REFERENCE'S FILLINGS.
+This is the most common failure mode. The reference's specific person / pose / props / setting were chosen because they fit the REFERENCE'S title. For the user's title you have to choose new fillings — each one driven by what the user's title is about — that occupy the same slots in the same grammar.
+
+Examples (notice every slot's filling is re-derived from the user's title; only the slot structure transfers):
+
+  • Reference: thumbnail for a story about a Japanese tool-company founder. Shows an elderly Japanese man in 1980s business attire, mid-pointing-gesture, against a blurred tech-workshop backdrop, with a red curved arrow + "THE GENIUS" text overlay.
+    User's title: "The Man Who Saved McDonald's".
+    → Output: an older white American man in his late 60s, slicked-back gray hair, dark mid-century business suit with a thin tie, a confident sell / pitch gesture (one hand forward, palm up, as if presenting), against a blurred vintage 1960s American diner interior with warm red-and-yellow ambient color. Text overlay reads something like "THE SALESMAN" in the same font weight/position. Same red curved arrow pattern pointing at the new hero. The PERSON is American because the title is American. The POSE is a "pitch / sell" gesture because the title is about salesmanship. The SETTING is a 1960s American diner because the title is about a fast-food chain in that era. The GRAMMAR (centered hero + text + arrow + warm blurred backdrop) is the only thing that transferred unchanged.
+
+  • Reference: thumbnail for a pop-star video showing a specific identifiable woman centered, sequins and stage lighting, mid-song expression.
+    User's title is about a different pop star from a different era / nationality.
+    → Output: a woman matching that DIFFERENT pop star's era and look — a 1970s American woman in glam-rock attire if the title is about a 70s star; a Korean woman in current K-pop styling if the title is about a K-pop star. Stage-lighting STYLE transfers, but stage decor adapts to the new genre.
+
+  • Reference: a Pope thumbnail showing the current Pope mid-blessing in St Peter's Square.
+    User's title is about a 1500s Pope.
+    → Output: an older European man in Renaissance-era papal vestments (tall white mitre, heavily-embroidered gold-trimmed robes, distinct from the modern simplified vestments), inside a candle-lit stone-cathedral interior, painted in a Renaissance-portrait style. Same close-up framing, same gravitas. Pose chosen for a 1500s-pope feel (e.g. seated, holding a scroll), not the modern blessing pose.
+
+  • Reference: a luxury-watch tier list showing a specific iconic dive watch in the top slot.
+    User's title is about a different watchmaker.
+    → Output: the visual hallmarks of THAT watchmaker's signature pieces (case shape, dial layout, bracelet style, distinguishing complications). Same tier-list grid structure, same labels' position and font.
+
+THE GRAMMAR TRANSFERS (slot positions, lighting style, palette family, text-overlay structure, visual device kit). EVERY FILLING RE-DERIVES from the user's title.
+
+When you describe the new fillings, BE EXPLICIT in concrete prose AND make the descriptors point in a clearly DIFFERENT direction from the reference's fillings on at least two axes (e.g. different ethnicity AND different clothing era; different setting AND different pose). Vague phrases like "an older man" let the reference image's identity bleed through; specific contrastive descriptors push the generator away from copying. The descriptors should be specific enough that swapping to a named person/brand would only add one word — but you do not add that word.
+
 ═══════════════════════════════════════════════════════════════════════════
-HOW TO WRITE THE OUTPUT
-═══════════════════════════════════════════════════════════════════════════
 
-Output ONE natural-language paragraph, 150–250 words. Structure it in this order:
+Do these steps internally — do NOT show your reasoning in the output:
 
-1. LEAD WITH THE NEW SUBJECT. The first ~50 words of the prompt describe WHAT THE NEW IMAGE DEPICTS — the person / object / scene the user's title implies. Be concrete and specific (physical descriptors, period cues, attire, expression / pose that narrates the user's title's main verb).
+STEP 1 — UNDERSTAND THE REFERENCE'S CHOICES.
+Walk the structured analysis element by element (every object, the composition, palette, lighting, every text_ocr entry, every semantic relationship). For each one, ask: "WHY did the designer pick THIS specific filling for THE REFERENCE'S TITLE?" The answer is always semantic, e.g. "they picked a Japanese man because the company is Japanese", "they picked a confident-pointing pose because the title is about teaching/revelation", "they picked a tech-workshop backdrop because the company makes tech". Identify the GRAMMAR (the slots + relationships) separately from the FILLINGS (the specific choices that filled the slots for the reference's title).
 
-2. SET THE SCENE. Describe the setting / environment that fits the user's title's domain. Again concrete, freshly chosen — not a relabel of the reference's setting.
+STEP 2 — RE-DERIVE EACH FILLING FROM THE USER'S TITLE.
+For every slot you identified, ask: "What's the right filling FOR THE USER'S TITLE, given the same grammar?"
+  • PERSON slot → ethnicity, age, era, attire derived from the user's title's subject (American business figure → American-looking; 1500s Pope → Renaissance-era vestments; modern K-pop → current K-pop styling).
+  • POSE slot → the gesture that visually narrates the user's title's main verb / claim (title about salesmanship → a pitch / sell gesture; title about discovery → an "aha" reach; title about secrecy → a finger-to-lips). Do NOT echo the reference's specific limb position — choose the pose that fits the new title.
+  • SETTING / BACKGROUND slot → the environment that signals the user's title's domain at a glance (Japanese tech-co → a tech workshop; American fast-food chain → a vintage diner; medieval cathedral → candle-lit stone interior).
+  • TEXT slot → a punchy word/phrase derived from the user's title's narrative hook (same format as the reference's text — single label, headline + subhead, etc).
+  • VISUAL DEVICE slot → same kind of device (arrow / circle / price tag), pointing at / labeling the new hero.
 
-3. PULL STYLE FROM THE REFERENCE in prose, AT THE END of the prompt. Phrasings like: "rendered with the same warm cinematic lighting as the reference image", "matching the muted teal-and-amber palette and grainy film texture of the reference", "in the bold all-caps sans-serif typography style of the reference image". The reference image is attached to the actual image-gen call, so the model can read style from it — your prose just nudges WHICH style attributes to copy.
+The GRAMMAR (slot positions, lighting style, palette family, font weight, visual device shape) transfers unchanged. EVERY FILLING is re-derived.
 
-4. SPECIFY THE TEXT OVERLAY by content and abstract position only. Example: "a punchy two-line headline reading 'THE SALESMAN' in the upper-left, bold all-caps sans-serif white with a hard drop shadow". Pull the text content from the user's title's hook. NEVER write "in the same position as the reference's text" — that bakes the reference's layout into your prompt.
+STEP 3 — WRITE THE OUTPUT.
+Output ONE polished image-generation prompt: a single natural-language paragraph, ~200–300 words. The prompt will be sent to an image-generation model ALONGSIDE the reference image itself as a visual input — use BOTH channels efficiently:
 
-5. NAME THE MEDIUM at the end: "rendered as a photograph", "rendered as a CGI illustration", "rendered as a halftone print" — match the reference's medium.
+  • DESCRIBE EXPLICITLY (the prompt is the only signal for these): the new subject content; the composition / layout (the structural pattern the reference uses, applied to the new subject — what's where in the frame); the text overlay CONTENT (exact wording drawn from the user's title plus approximate position and the structure like headline + subhead); the visual devices the layout includes (arrows, price tags, badges, number labels — name what's there and what it says, e.g. "a red curved arrow pointing at X" / "a yellow price tag in the bottom-right reading $24").
 
-Things you must NEVER write in the output prompt:
-  ✗ "matching the reference image's composition" / "in the same layout as the reference"
-  ✗ "where the [reference object] is in the reference, put [new object]"
-  ✗ "with the same [reference's specific object] in the [reference's specific position]"
-  ✗ The reference's specific person / pose / props / text words
-  ✗ Bullet lists, headings, step labels. Pure prose only.
+  • REFERENCE THE IMAGE for attributes that are hard or imprecise to verbalize — color palette, exact background tone, typography (font family, weight, treatment), textures (halftone, grain, paint, glow, gradient quality), lighting feel, the specific styling of any visual devices. Phrasing like "matching the halftone dot texture in the reference image", "using the same vibrant color palette as the reference image", "in the bold sans-serif title style of the reference image", "with the same hard, diffused lighting as the reference image" is GOOD — the image is literally attached to the call, so the model can look at it for those qualities.
 
-Things you should write:
-  ✓ Concrete description of the NEW subject as if you were briefing a photographer who has never seen the reference.
-  ✓ Abstract composition cues only ("centred close-up", "wide establishing shot", "tier-list grid", "side-by-side comparison").
-  ✓ Style-transfer phrases that cite "the reference image" for palette, lighting, mood, typography, texture, medium.
+  • Heuristic: if you'd have to invent exact hex codes / font names / texture descriptions to put it in words, say "as in the reference image" instead. If you can describe it precisely in concrete prose (subject identity, layout pattern, what the text says), describe it.
 
-Output ONLY the final prompt — no preamble, no reasoning labels, no commentary."""
+Use natural prose, not bullets. Do NOT use the words "template", "inspiration", or "YouTube" — but "reference image" IS okay (and useful) for the style-reference phrases described above. Output ONLY the final prompt — no preamble, no reasoning labels, no commentary."""
 
 
 def _map_reference_to_title_via_gemini(
@@ -555,10 +592,10 @@ def _map_reference_to_title_via_gemini(
     import base64 as _b64
 
     style_hint_text = {
-        "person_focal": "the user's video format involves a real on-camera creator (informational only — does NOT override RULE 1. If the reference is faceless, the output stays faceless.)",
-        "faceless": "the user's video format has no on-camera person (informational only — does NOT override RULE 1. If the reference features a person, the output keeps one person.)",
-        "none": "no hint about the user's video format; the reference's person-count decides.",
-    }.get(style_preset or "none", "no hint")
+        "person_focal": "the user's video format involves a real on-camera creator (informational only — does NOT override Rule 2. If the reference is faceless, the output stays faceless.)",
+        "faceless": "the user's video format has no on-camera person (informational only — does NOT override Rule 3. If the reference features a person, the output keeps a person.)",
+        "none": "no hint about the user's video format; rely entirely on the reference's structural pattern.",
+    }.get(style_preset or "none", "no hint; rely entirely on the reference's structural pattern")
 
     reference_title_str = reference_title.strip() if reference_title else "(unknown — reason from the image alone)"
 
