@@ -601,13 +601,15 @@
     position: relative;     /* lets the searching overlay pin to the grid */
     min-height: 60px;       /* keeps the spinner visible even if grid is mid-clear */
   }
-  /* While a search is in flight: dim the existing cards and pin a centred
-     spinner over the grid. The widget keeps the old results behind it so
-     the layout doesn't collapse and reflow when the new set lands. */
-  .outliers-grid.searching > .outlier-card {
-    opacity: 0.25;
-    pointer-events: none;
-    transition: opacity 0.18s ease;
+  /* While a search is in flight: clear the grid and show just a centred
+     spinner. The grid keeps a tall min-height so the box doesn't
+     collapse and the layout below doesn't jump. */
+  .outliers-grid.searching > .outlier-card,
+  .outliers-grid.searching > .outliers-empty {
+    display: none;
+  }
+  .outliers-grid.searching {
+    min-height: 220px;
   }
   .outliers-search-overlay {
     position: absolute;
@@ -615,7 +617,8 @@
     display: none;
     align-items: center;
     justify-content: center;
-    gap: 10px;
+    flex-direction: column;
+    gap: 12px;
     z-index: 5;
     pointer-events: none;
     color: var(--sub);
@@ -625,9 +628,9 @@
   }
   .outliers-grid.searching > .outliers-search-overlay { display: flex; }
   .outliers-search-overlay-dot {
-    width: 14px; height: 14px;
-    border: 2px solid rgba(255, 255, 255, 0.18);
-    border-top-color: var(--sub);
+    width: 28px; height: 28px;
+    border: 2.5px solid rgba(255, 255, 255, 0.12);
+    border-top-color: rgba(255, 255, 255, 0.7);
     border-radius: 50%;
     animation: spin 0.7s linear infinite;
   }
@@ -3434,7 +3437,7 @@ function initDropdowns() {
         if (!outliersGrid.querySelector(".outliers-search-overlay")) {
           const ov = document.createElement("div");
           ov.className = "outliers-search-overlay";
-          ov.innerHTML = '<span class="outliers-search-overlay-dot"></span><span>Searching algrow…</span>';
+          ov.innerHTML = '<span class="outliers-search-overlay-dot"></span>';
           outliersGrid.appendChild(ov);
         }
       }
