@@ -711,12 +711,14 @@ def _shorten_topic(topic: str, keep: int = 3) -> str:
 
 
 def _algrow_search_once(topic: str, content_type: str, limit: int,
-                        min_outlier_score: float) -> tuple[list[dict], str | None, int]:
-    """One round-trip to algrow. Returns (videos, error, count).
+                        min_outlier_score: float, page: int = 1
+                        ) -> tuple[list[dict], str | None, int, bool]:
+    """One round-trip to algrow. Returns (videos, error, count, has_more).
     `videos` is the raw video dicts (not yet normalized to our outlier shape).
+    `has_more` mirrors algrow's response field — True when more pages exist.
     """
     if not _ALGROW_API_KEY:
-        return [], "Algrow integration not configured (set ALGROW_API_KEY).", 0
+        return [], "Algrow integration not configured (set ALGROW_API_KEY).", 0, False
     try:
         resp = requests.post(
             f"{_ALGROW_API_BASE}/api/viral-videos/search",
@@ -730,70 +732,89 @@ def _algrow_search_once(topic: str, content_type: str, limit: int,
                 "sort_by": "similarity",
                 "per_page": max(1, min(int(limit), 24)),
                 "min_outlier_score": min_outlier_score,
+                "page": max(1, int(page)),
             },
             timeout=90,
         )
         data = resp.json() if resp.content else {}
     except requests.exceptions.Timeout:
-        return [], "Algrow timed out (>90s). Try a more specific topic.", 0
+        return [], "Algrow timed out (>90s). Try a more specific topic.", 0, False
     except Exception as e:
         logger.warning(f"algrow API call failed: {e}")
-        return [], _friendly_error(str(e)), 0
+        return [], _friendly_error(str(e)), 0, False
 
     if resp.status_code != 200 or not data.get("success"):
-        return [], _friendly_error(data.get("error") or f"algrow returned HTTP {resp.status_code}"), 0
+        return [], _friendly_error(data.get("error") or f"algrow returned HTTP {resp.status_code}"), 0, False
     videos = data.get("videos") or []
-    return videos, None, int(data.get("count") or len(videos))
+    return videos, None, int(data.get("count") or len(videos)), bool(data.get("has_more"))
 
 
 def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
-                                 limit: int = 12, min_outlier_score: float = 2.0
-                                 ) -> tuple[list[dict], str | None]:
+                                 limit: int = 12, min_outlier_score: float = 2.0,
+                                 page: int = 1
+                                 ) -> tuple[list[dict], str | None, str, bool]:
     """Server-internal call to algrow's viral-videos search.
 
-    Returns (outliers, error). On error, outliers is [] and error has the
-    user-facing message. Same params + same shape as find_outlier_references
-    so the two paths produce identical widget state.
+    Returns (outliers, error, effective_topic, has_more). On error,
+    outliers is [] and error has the user-facing message; effective_topic
+    is the original topic and has_more is False. Same first two slots as
+    before so existing tuple-unpacking callers see the same shape via
+    indexing.
 
     Falls back to shorter topic phrasings if the verbatim search returns
     zero — algrow's semantic search struggles with long YouTube-style
-    question titles (see _shorten_topic comment).
+    question titles (see _shorten_topic comment). Fallback ONLY runs on
+    page=1; for page>1 the caller is asking for the next page of a
+    SPECIFIC previously-effective topic, so we use it verbatim to keep
+    the result set stable across pages.
     """
     if not _ALGROW_API_KEY:
-        return [], "Algrow integration not configured (set ALGROW_API_KEY)."
+        return [], "Algrow integration not configured (set ALGROW_API_KEY).", topic, False
 
     tried: list[str] = []
     videos: list[dict] = []
     last_err: str | None = None
-    # Build the fallback chain. First try verbatim; if 0 results, try the
-    # last 3 significant words, then the last 2. Dedupe + skip empties.
-    candidates = [topic.strip()]
-    for n in (3, 2):
-        short = _shorten_topic(topic, keep=n)
-        if short and short.lower() not in {c.lower() for c in candidates}:
-            candidates.append(short)
-    for q in candidates:
-        if not q:
-            continue
-        tried.append(q)
-        vids, err, count = _algrow_search_once(q, content_type, limit, min_outlier_score)
+    effective_topic = topic.strip()
+    has_more = False
+
+    if page > 1:
+        # Pagination request — use the topic verbatim, no fallback.
+        tried.append(topic.strip())
+        vids, err, count, hm = _algrow_search_once(topic.strip(), content_type, limit, min_outlier_score, page)
         if err:
-            last_err = err
-            continue
-        if count > 0:
-            videos = vids
-            logger.info(f"algrow: returned {count} for q='{q}' (tried {tried})")
-            break
+            return [], err, topic.strip(), False
+        videos = vids
+        has_more = hm
+        logger.info(f"algrow: page {page} returned {count} for q='{topic}'")
+    else:
+        # First page — try verbatim, then shortened fallbacks.
+        candidates = [topic.strip()]
+        for n in (3, 2):
+            short = _shorten_topic(topic, keep=n)
+            if short and short.lower() not in {c.lower() for c in candidates}:
+                candidates.append(short)
+        for q in candidates:
+            if not q:
+                continue
+            tried.append(q)
+            vids, err, count, hm = _algrow_search_once(q, content_type, limit, min_outlier_score, page)
+            if err:
+                last_err = err
+                continue
+            if count > 0:
+                videos = vids
+                has_more = hm
+                effective_topic = q
+                logger.info(f"algrow: returned {count} for q='{q}' (tried {tried}, has_more={hm})")
+                break
 
     if not videos:
-        # No hits across the whole fallback chain. Return the most recent
-        # error if any, else a friendly "nothing matched" message.
         if last_err:
-            return [], last_err
+            return [], last_err, effective_topic, False
         return [], (
             f"No viral references found for any of: {', '.join(repr(q) for q in tried)}. "
             "Try a broader 2-3 word topic (e.g. 'black hole' instead of a full question)."
-        )
+        ), effective_topic, False
 
     # Normalize to our outlier shape. The 200/success guard already ran in
     # _algrow_search_once, so we don't need to re-check it here.
@@ -812,7 +833,7 @@ def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
                 if v.get("video_id") else None
             ),
         })
-    return outliers, None
+    return outliers, None, effective_topic, has_more
 
 
 # Reference URLs accepted by generate_thumbnail. The widget surface is a
@@ -1076,7 +1097,7 @@ def _build_mcp() -> FastMCP:
         outliers_list: list[dict] = []
         outlier_error: str | None = None
         if find_outliers_first and _ALGROW_API_KEY:
-            outliers_list, outlier_error = _fetch_outliers_from_algrow(
+            outliers_list, outlier_error, _eff_topic, _has_more = _fetch_outliers_from_algrow(
                 topic=(outlier_topic or prompt).strip(),
             )
             for o in outliers_list[:3]:
@@ -1452,8 +1473,9 @@ def _build_mcp() -> FastMCP:
             topic: Annotated[str, Field(description="Algrow semantic search query. When `title` is being passed, set `topic` to the EXACT SAME STRING as `title` (verbatim, no elaboration, no keyword expansion, no rewording). Algrow's semantic search handles full titles fine, and your elaborated versions actually retrieve worse — they over-generalize the query and surface off-topic outliers. ONLY produce a different `topic` value when no `title` is available (e.g. the user just said 'show me viral elephant thumbnails' with no specific video idea) — in that case keep it short, 2–4 words.")],
             title: Annotated[str | None, Field(description="The user's video title — what the thumbnail is for. e.g. 'Why Amazon Prime is Failing', 'Every Elephant Explained in 11 Minutes'. The widget pre-fills its TITLE field with this AND the server uses it as the basis for the engineered prompt after the user picks a reference. ALWAYS pass this when you have the title. When you pass it, `topic` should be set to this same string verbatim — see the `topic` field doc.")] = None,
             content_type: Annotated[str, Field(description="longform or shorts. Default longform.")] = "longform",
-            limit: Annotated[int, Field(description="Max thumbnails to return. Default 12, capped at 24.")] = 12,
+            limit: Annotated[int, Field(description="Max thumbnails to return per page. Default 12, capped at 24.")] = 12,
             min_outlier_score: Annotated[float, Field(description="Floor on outlier multiplier — only include videos that outperformed their channel average by at least this factor. Default 2.0 (validated against hand-eval: lower lets in too much noise, higher misses too many strong references).")] = 2.0,
+            page: Annotated[int, Field(description="1-indexed algrow page. Default 1. Used by the widget's 'load more' pagination — Claude shouldn't normally pass this directly.")] = 1,
         ) -> str:
             """DEFAULT entry point when the user wants a thumbnail and a
             title is available. Drives a three-step in-widget flow that the
@@ -1493,11 +1515,12 @@ def _build_mcp() -> FastMCP:
                 bucket = _load_state_bucket()
                 if bucket.pop(_state_key(title), None) is not None:
                     _save_state_bucket(bucket)
-            outliers, error = _fetch_outliers_from_algrow(
+            outliers, error, effective_topic, has_more = _fetch_outliers_from_algrow(
                 topic=search_query,
                 content_type=content_type,
                 limit=limit,
                 min_outlier_score=min_outlier_score,
+                page=page,
             )
             # Only include the error key on actual error — Claude tends to
             # read the *presence* of an "error" field as a failure signal
@@ -1505,10 +1528,12 @@ def _build_mcp() -> FastMCP:
             # means "algrow had nothing for this topic", not a tool fault.
             payload = {
                 "view": "outlier_picker",
-                "topic": search_query,
+                "topic": effective_topic or search_query,
                 "content_type": content_type,
                 "outliers": outliers,
                 "count": len(outliers),
+                "page": page,
+                "has_more": has_more,
             }
             if title:
                 payload["title"] = title

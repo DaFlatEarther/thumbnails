@@ -1009,8 +1009,20 @@ const outlierPagerLabel = document.getElementById("outlier-pager-label");
 
 // Outlier pager state. Holds the full list so prev/next can re-render
 // the right slice without re-fetching. Reset on every fresh payload.
+// `serverPage` / `hasMore` track algrow-side pagination — when the user
+// hits the right arrow on the last LOCAL page AND hasMore is true, the
+// widget transparently fetches the next algrow page and appends.
 const OUTLIER_PAGE_SIZE = 6;
-let _outlierPagerState = { list: [], page: 0, payload: null };
+let _outlierPagerState = {
+  list: [],
+  page: 0,           // 0-indexed local (display) page
+  payload: null,
+  topic: "",
+  contentType: "longform",
+  serverPage: 1,     // 1-indexed algrow page we last fetched
+  hasMore: false,
+  fetchingMore: false,
+};
 const outliersCloseBtn = document.getElementById("outliers-close-btn");
 const titleBox = document.getElementById("title-box");
 const titleEl = document.getElementById("title");
@@ -1428,7 +1440,28 @@ function renderOutliers(payload) {
   _outlierPagerState.list = list.filter((o) => o && o.thumbnail_url);
   _outlierPagerState.payload = payload;
   _outlierPagerState.page = 0;
+  _outlierPagerState.topic = (typeof payload?.topic === "string") ? payload.topic : "";
+  _outlierPagerState.contentType = payload?.content_type || "longform";
+  _outlierPagerState.serverPage = Number.isFinite(payload?.page) ? payload.page : 1;
+  _outlierPagerState.hasMore = !!payload?.has_more;
+  _outlierPagerState.fetchingMore = false;
   renderOutlierPage();
+}
+
+// Append additional algrow results from a "load more" round-trip without
+// resetting the user's current display page. Called by the next-arrow
+// handler when on the last local page and hasMore is true.
+function appendOutliers(payload) {
+  const more = Array.isArray(payload?.outliers) ? payload.outliers : [];
+  const filtered = more.filter((o) => o && o.thumbnail_url);
+  // Dedupe — algrow shouldn't repeat across pages but defensive in case.
+  const seen = new Set(_outlierPagerState.list.map((o) => o.video_id).filter(Boolean));
+  for (const o of filtered) {
+    if (!o.video_id || !seen.has(o.video_id)) _outlierPagerState.list.push(o);
+  }
+  _outlierPagerState.serverPage = Number.isFinite(payload?.page) ? payload.page : _outlierPagerState.serverPage + 1;
+  _outlierPagerState.hasMore = !!payload?.has_more;
+  _outlierPagerState.fetchingMore = false;
 }
 
 // Render the slice of _outlierPagerState.list belonging to the current
@@ -1506,13 +1539,25 @@ function renderOutlierPage() {
     outliersGrid.appendChild(card);
   }
 
-  // Pager controls — hide entirely when there's only one page worth.
+  // Pager controls. Visible if there's more than one local page OR the
+  // server reports hasMore (so the next-arrow can fetch additional pages).
   if (outliersPager) {
-    const showPager = list.length > OUTLIER_PAGE_SIZE;
+    const hasMoreFromServer = !!_outlierPagerState.hasMore;
+    const showPager = list.length > OUTLIER_PAGE_SIZE || hasMoreFromServer;
     outliersPager.classList.toggle("hidden", !showPager);
-    if (outlierPagerLabel) outlierPagerLabel.textContent = `Page ${clampedPage + 1} / ${totalPages}`;
-    if (outlierPagerPrev) outlierPagerPrev.disabled = clampedPage <= 0;
-    if (outlierPagerNext) outlierPagerNext.disabled = clampedPage >= totalPages - 1;
+    if (outlierPagerLabel) {
+      const totalLabel = hasMoreFromServer ? `${totalPages}+` : `${totalPages}`;
+      outlierPagerLabel.textContent = _outlierPagerState.fetchingMore
+        ? "Loading more…"
+        : `Page ${clampedPage + 1} / ${totalLabel}`;
+    }
+    if (outlierPagerPrev) outlierPagerPrev.disabled = clampedPage <= 0 || _outlierPagerState.fetchingMore;
+    // Next is enabled if there's a local next page, OR we can fetch more
+    // from the server. Disabled while a fetch is in flight.
+    if (outlierPagerNext) {
+      const canLocalNext = clampedPage < totalPages - 1;
+      outlierPagerNext.disabled = (_outlierPagerState.fetchingMore || (!canLocalNext && !hasMoreFromServer));
+    }
   }
 
   refreshComposeRow();
@@ -2969,11 +3014,46 @@ function initDropdowns() {
     });
   }
   if (outlierPagerNext) {
-    outlierPagerNext.addEventListener("click", () => {
+    outlierPagerNext.addEventListener("click", async () => {
+      if (_outlierPagerState.fetchingMore) return;
       const last = Math.max(0, Math.ceil(_outlierPagerState.list.length / OUTLIER_PAGE_SIZE) - 1);
-      if (_outlierPagerState.page >= last) return;
-      _outlierPagerState.page += 1;
-      renderOutlierPage();
+      // Plain next-page within already-loaded results.
+      if (_outlierPagerState.page < last) {
+        _outlierPagerState.page += 1;
+        renderOutlierPage();
+        return;
+      }
+      // We're on the last loaded page. If the server says there's more,
+      // fetch the next algrow page and append, then advance the display
+      // page so the user lands on the new cards.
+      if (!_outlierPagerState.hasMore) return;
+      _outlierPagerState.fetchingMore = true;
+      renderOutlierPage();  // re-render to show the "Loading more…" label
+      try {
+        const res = await app.callServerTool({
+          name: "find_outlier_references",
+          arguments: {
+            topic: _outlierPagerState.topic,
+            content_type: _outlierPagerState.contentType,
+            page: _outlierPagerState.serverPage + 1,
+          },
+        });
+        const text = res?.content?.[0]?.text ?? "";
+        const data = text ? JSON.parse(text) : null;
+        if (data) {
+          appendOutliers(data);
+          // Advance to the FIRST newly-loaded display page.
+          _outlierPagerState.page = last + 1;
+          renderOutlierPage();
+        } else {
+          _outlierPagerState.fetchingMore = false;
+          renderOutlierPage();
+        }
+      } catch (err) {
+        _outlierPagerState.fetchingMore = false;
+        renderOutlierPage();
+        console.warn("load more failed:", err);
+      }
     });
   }
 

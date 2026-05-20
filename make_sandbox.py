@@ -53,7 +53,9 @@ const SANDBOX_TOOL_HANDLERS = {
   load_widget_state: () => ({ content: [{ text: JSON.stringify({ state: null }) }] }),
   save_widget_state: () => ({ content: [{ text: "{}" }] }),
   find_outlier_references: (args) => ({
-    content: [{ text: JSON.stringify(sandboxOutlierPickerMulti(args && args.topic)) }],
+    content: [{ text: JSON.stringify(
+      sandboxOutlierPickerMulti(args && args.topic, args && args.page)
+    ) }],
   }),
   compose_thumbnail_prompt: (args) => ({
     content: [{ text: JSON.stringify({
@@ -95,8 +97,11 @@ function sandboxOutlierPickerSingle(opts) {
   };
 }
 
-function sandboxOutlierPickerMulti(topic) {
-  const samples = [
+function sandboxOutlierPickerMulti(topic, page) {
+  // Two banks of fake outliers so the sandbox can exercise the "load
+  // more" pagination flow — page 1 returns the first bank with
+  // has_more:true, page 2 returns the second bank with has_more:false.
+  const page1 = [
     { vid: "Rm-hSXCv5ko", title: "The 7 Levels of Kpop",  channel: "internetsnathan", views: 312445, score: 3.8 },
     { vid: "7zD0hGhMVqg", title: "The Man Who Turned A Lifelong Failure Into KFC", channel: "Biz Stories", views: 209926, score: 3.78 },
     { vid: "OyKPASXUy48", title: "The Fascinating Story of Ryobi", channel: "Brand Origins", views: 145001, score: 2.9 },
@@ -105,16 +110,28 @@ function sandboxOutlierPickerMulti(topic) {
     { vid: "bIEe29lh6_I", title: "How Time Becomes Space Inside a Black Hole", channel: "Cosmic", views: 712998, score: 5.2 },
     { vid: "fT4zkqM6JSQ", title: "The Man Who Accidentally Saved Nintendo", channel: "Modern Ideas", views: 19559, score: 2.4 },
     { vid: "a4KFGbW5iwI", title: "Inside The Worst Hotel In America", channel: "Decay Diaries", views: 822411, score: 4.1 },
-    { vid: "CIJ7PmGvYns", title: "Why Nobody Buys Subarus Anymore", channel: "Car Forensics", views: 612200, score: 3.4 },
-    { vid: "Rm-hSXCv5ko", title: "Every Lava Cake Recipe Tier List", channel: "Culinary Codex", views: 191002, score: 2.6 },
-    { vid: "OyKPASXUy48", title: "How A 17-Year-Old Built Snapchat", channel: "Founder Files", views: 358770, score: 3.5 },
-    { vid: "7zD0hGhMVqg", title: "Why Walmart Crushed Sears", channel: "Retail Wars", views: 444180, score: 2.85 },
+    { vid: "dQw4w9WgXcQ", title: "Why Nobody Buys Subarus Anymore", channel: "Car Forensics", views: 612200, score: 3.4 },
+    { vid: "kJQP7kiw5Fk", title: "Every Lava Cake Recipe Tier List", channel: "Culinary Codex", views: 191002, score: 2.6 },
+    { vid: "9bZkp7q19f0", title: "How A 17-Year-Old Built Snapchat", channel: "Founder Files", views: 358770, score: 3.5 },
+    { vid: "3JZ_D3ELwOQ", title: "Why Walmart Crushed Sears", channel: "Retail Wars", views: 444180, score: 2.85 },
   ];
+  const page2 = [
+    { vid: "FTQbiNvZqaY", title: "The Hidden Math Behind Pixar", channel: "Animation Decoded", views: 1102331, score: 5.8 },
+    { vid: "OPf0YbXqDm0", title: "Inside Costco's Profit Engine", channel: "Retail Wars", views: 712006, score: 4.2 },
+    { vid: "uelHwf8o7_U", title: "Why Lego Almost Went Bankrupt", channel: "Founder Files", views: 521442, score: 3.6 },
+    { vid: "RgKAFK5djSk", title: "How Stripe Won The Internet", channel: "Tech Origins", views: 408120, score: 3.1 },
+    { vid: "JGwWNGJdvx8", title: "The Real Reason Concorde Failed", channel: "Aviation Files", views: 1308221, score: 4.9 },
+    { vid: "fJ9rUzIMcZQ", title: "Why Boeing Lost Its Edge", channel: "Industry Notes", views: 645501, score: 3.4 },
+  ];
+  const pg = Math.max(1, Number(page) || 1);
+  const samples = pg === 1 ? page1 : page2;
   return {
     view: "outlier_picker",
     topic: topic || "viral thumbnail references",
     title: "",
     content_type: "longform",
+    page: pg,
+    has_more: pg === 1,  // page 2 is the last; sandbox keeps this small
     outliers: samples.map((s) => ({
       video_id: s.vid,
       title: s.title,
