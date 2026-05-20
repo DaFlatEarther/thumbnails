@@ -1733,8 +1733,11 @@ function renderOutliers(payload) {
           const res = await _appRef.callServerTool({
             name: "find_outlier_references",
             arguments: {
+              // Pass topic verbatim as the algrow `q` — DON'T forward
+              // the title field. The server uses `(title or topic)` so
+              // a populated title would override the user's typed search
+              // here, which is the opposite of what they want.
               topic: newTopic,
-              title: titleEl?.value || undefined,
               content_type: payload?.content_type || "longform",
             },
           });
@@ -3391,8 +3394,10 @@ function initDropdowns() {
         const res = await app.callServerTool({
           name: "find_outlier_references",
           arguments: {
+            // Pass topic verbatim. NO title — server uses (title or
+            // topic), so a populated title field would silently
+            // override the user's typed search.
             topic: newTopic,
-            title: titleEl?.value || undefined,
             content_type: "longform",
           },
         });
