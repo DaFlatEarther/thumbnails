@@ -2,6 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="color-scheme" content="dark" />
 <!-- Preconnect to Kie's image CDN so the first thumbnail loads fast once it
      arrives. (The CSP allowlist on the resource declares the same origins.) -->
@@ -828,6 +829,125 @@
     overflow: hidden;
     text-overflow: ellipsis;
     min-width: 0;
+  }
+
+  /* ─────────── Mobile (≤640px) ────────────────────────────────────────
+     Phones get a narrow single-column layout. The big tweaks: stack the
+     four-dropdown row so dropdowns stack one per line, drop the extra
+     bottom padding (no dropdown overflow to worry about when each menu
+     opens against an empty column), single-column outlier grid, larger
+     touch targets, smaller meta text. The widget iframe in claude.ai
+     respects the viewport meta above and switches into this branch when
+     the device width drops below 640px.
+  */
+  @media (max-width: 640px) {
+    .wrap {
+      gap: 12px;
+      padding: 4px 4px 60px;
+    }
+    .preview { border-radius: 12px; }
+    textarea, input[type="text"] {
+      padding: 12px;        /* slightly bigger touch target */
+      font-size: 14px;      /* avoid iOS Safari zoom-on-focus */
+      border-radius: 12px;
+    }
+    .row { gap: 6px; }
+    /* Make the four dropdowns + Generate button into a vertical stack so
+       nothing crunches awkwardly between aspect-ratio and Generate. */
+    .row > .dropdown-wrapper {
+      flex: 1 1 calc(50% - 4px);
+      min-width: 0;
+    }
+    .dropdown-btn {
+      min-width: 0;
+      width: 100%;
+      padding: 11px 12px;
+      font-size: 13px;
+    }
+    .dropdown-text {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .dropdown-menu {
+      font-size: 13px;
+    }
+    .dropdown-item { padding: 11px 12px; }
+    button.primary {
+      width: 100%;
+      padding: 13px 20px;
+      font-size: 14px;
+    }
+    /* The flex spacer (<span style="flex:1;">) breaks layout when wrapped
+       — collapse it on mobile. */
+    .row > span[style*="flex:1"] { flex: 0 0 0; display: none; }
+
+    /* Outlier picker — header stacks vertically, search input goes full-
+       width, single-column card grid. */
+    .outliers-section { padding: 12px; gap: 12px; }
+    .outliers-header { flex-direction: column; align-items: stretch; gap: 8px; }
+    .outliers-header-left { gap: 6px; }
+    .outliers-header .title { font-size: 13px; }
+    .outliers-header .sub { font-size: 11px; margin-left: 4px; }
+    .outliers-search { max-width: 100%; }
+    .outliers-search input {
+      padding: 11px 50px 11px 32px;
+      font-size: 14px;
+    }
+    .outliers-search-hint { display: none; }  /* mobile keyboards have their own Enter */
+    /* Close button gets a row of its own so it doesn't crowd the title. */
+    .outliers-header > #outliers-close-btn {
+      align-self: flex-end;
+      margin-top: -28px;     /* float over the title row */
+    }
+    .outliers-grid {
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+    .outlier-card {
+      flex-direction: row;
+      padding: 8px;
+      gap: 10px;
+    }
+    .outlier-card .thumb-wrap {
+      width: 130px;
+      flex-shrink: 0;
+      aspect-ratio: 16/9;
+    }
+    .outlier-card .o-meta { padding: 0; gap: 4px; justify-content: center; }
+    .outlier-card .o-title { font-size: 12px; -webkit-line-clamp: 2; }
+    .outlier-card .o-meta-top { font-size: 11px; }
+    .outlier-card .o-views { font-size: 11.5px; }
+    .outlier-card .o-channel-name { font-size: 11px; }
+    .outlier-card .score-badge { font-size: 10px; padding: 3px 8px; }
+    .outlier-card .o-avatar { width: 20px; height: 20px; font-size: 10px; }
+    /* Pager — chunkier finger targets, slightly bigger label. */
+    .outlier-pager-btn { width: 36px; height: 36px; }
+    .outlier-pager-label { font-size: 12px; min-width: 96px; }
+    /* Empty state — make the suggestion chips bigger so they're tappable. */
+    .outliers-empty { padding: 24px 16px; }
+    .outliers-suggestion { padding: 8px 16px; font-size: 13px; }
+
+    /* Ref-thumb tiles a touch larger for visibility, and the URL textarea
+       gets the iOS-friendly font-size bump. */
+    .ref-thumb { width: 96px; height: 54px; }
+    .ref-box textarea { font-size: 13px; }
+
+    /* Generation game/loader corner overlay — smaller font + tighter top
+       so it doesn't crowd the canvas on small screens. */
+    .gen-game-overlay { top: 10px; left: 12px; gap: 3px; }
+    .gen-game-status { font-size: 12px; }
+    .gen-game-sub { font-size: 10.5px; }
+
+    .label { font-size: 10px; }
+    .hint { font-size: 11px; }
+  }
+
+  /* ─────────── Ultra-narrow (≤380px) ────────────────────────────────── */
+  @media (max-width: 380px) {
+    .row > .dropdown-wrapper { flex: 1 1 100%; }
+    .outlier-card .thumb-wrap { width: 104px; }
+    .outliers-suggestion { width: 100%; }
   }
 </style>
 </head>
