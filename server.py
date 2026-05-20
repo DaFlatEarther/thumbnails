@@ -432,20 +432,17 @@ _REASONED_MAP_PROMPT = """You are an expert YouTube thumbnail designer. You will
 
 You have these inputs:
 
-  1. REFERENCE IMAGE — attached.
+  1. REFERENCE ANALYSIS — a complete structured JSON breakdown of the reference thumbnail produced by a prior vision pass. It is below. Treat it as ground truth — every visual fact about the reference is in this JSON.
   2. REFERENCE TITLE (the original video this thumbnail was made for): "{reference_title}"
   3. USER'S NEW TITLE (what we are designing for now): "{title}"
   4. Style hint about the user's video format: {style_hint}
 
-Before mapping, internally walk the reference image as a comprehensive visual checklist — do NOT emit this list, use it only to make sure your reasoning is thorough. The checklist (each item must be considered):
-  • meta: image quality, image type (photo / illustration / composite / etc).
-  • global_context: scene description, time of day, atmosphere, lighting (source, direction, quality, color temperature).
-  • color_palette: dominant colors (named + approximate hexes if confident), accent colors, contrast level.
-  • composition: camera angle, framing, depth of field, focal point.
-  • objects: every distinct object, its category (Person / Animal / Vehicle / Furniture / Text / Symbol / etc.), location (top-left/center/etc), prominence (foreground/midground/background), color, texture, material, state, relative size, pose/orientation, any text on it.
-  • text_ocr: every visible text element, exact wording, font style (serif / sans / display / handwritten / bold / italic / condensed), location, legibility.
-  • semantic_relationships: who/what is holding, obscuring, supporting, casting shadow on, visually echoing what.
-  • visual devices: arrows, circles, strikethroughs, price tags, badges, glow effects, comic-panel borders, etc.
+REFERENCE ANALYSIS JSON:
+```json
+{analysis_json}
+```
+
+Walk the JSON top to bottom before mapping — every field is load-bearing. Pay particular attention to: `global_context.lighting` (source / direction / quality / color_temp), `color_palette.dominant_hex_estimates` (use these as concrete hex codes in your output prompt), `composition` (camera angle / framing / DOF / focal point — these define the structural slots), every `objects[*]` entry (location, prominence, visual_attributes, micro_details — these are the slot fillings you must REPLACE), every `text_ocr.content[*]` entry (font style / location / legibility — text treatment transfers verbatim, text content gets rewritten for the new title), and `semantic_relationships` (visual devices like arrows, strings, callouts — these patterns transfer).
 
 ═══════════════════════════════════════════════════════════════════════════
 HARD RULES — these override everything else, including the style hint:
@@ -564,15 +561,27 @@ For every slot you identified, ask: "What's the right filling FOR THE USER'S TIT
 The GRAMMAR (slot positions, lighting style, palette family, font weight, visual device shape) transfers unchanged. EVERY FILLING is re-derived.
 
 STEP 3 — WRITE THE OUTPUT.
-Output ONE polished image-generation prompt: a single natural-language paragraph, ~200–300 words. The prompt will be sent to an image-generation model ALONGSIDE the reference image itself as a visual input — use BOTH channels efficiently:
+Output ONE polished image-generation prompt: a single natural-language paragraph, ~300–450 words.
 
-  • DESCRIBE EXPLICITLY (the prompt is the only signal for these): the new subject content; the composition / layout (the structural pattern the reference uses, applied to the new subject — what's where in the frame); the text overlay CONTENT (exact wording drawn from the user's title plus approximate position and the structure like headline + subhead); the visual devices the layout includes (arrows, price tags, badges, number labels — name what's there and what it says, e.g. "a red curved arrow pointing at X" / "a yellow price tag in the bottom-right reading $24").
+CRITICAL: the prompt will be sent to the image-gen model TEXT-ONLY. No reference image is attached. EVERY visual fact must be made explicit IN THE PROMPT TEXT, pulled from the JSON breakdown above. Do NOT write "as in the reference image", "matching the reference's palette", "in the same style as the reference" — there is no reference at generation time, those phrases tell the model nothing.
 
-  • REFERENCE THE IMAGE for attributes that are hard or imprecise to verbalize — color palette, exact background tone, typography (font family, weight, treatment), textures (halftone, grain, paint, glow, gradient quality), lighting feel, the specific styling of any visual devices. Phrasing like "matching the halftone dot texture in the reference image", "using the same vibrant color palette as the reference image", "in the bold sans-serif title style of the reference image", "with the same hard, diffused lighting as the reference image" is GOOD — the image is literally attached to the call, so the model can look at it for those qualities.
+Specifically you MUST explicitly describe in the prompt:
 
-  • Heuristic: if you'd have to invent exact hex codes / font names / texture descriptions to put it in words, say "as in the reference image" instead. If you can describe it precisely in concrete prose (subject identity, layout pattern, what the text says), describe it.
+  • LIGHTING — name the source ("warm overhead tungsten"), direction ("top-left key with soft fill from below-right"), hardness ("hard / soft / diffused"), color temperature ("warm 3200K feel" or "neutral daylight"). Pull these straight from `global_context.lighting`.
 
-Use natural prose, not bullets. Do NOT use the words "template", "inspiration", or "YouTube" — but "reference image" IS okay (and useful) for the style-reference phrases described above. Output ONLY the final prompt — no preamble, no reasoning labels, no commentary."""
+  • PALETTE — list the actual dominant hex codes from `color_palette.dominant_hex_estimates` ("dominated by #8B4513 warm corkboard brown, #E63946 vivid alarm red, #2B2B2B near-black"). Name the accent colors. Set the contrast level.
+
+  • COMPOSITION — camera angle, framing, depth of field, focal point. Where each slot lives in the frame (center / top-left / mid-right etc.) using the `objects[*].location` values.
+
+  • TEXT OVERLAYS — for every entry in `text_ocr.content`: the EXACT font style (serif / sans-serif / display / bold weight / italic / condensed), color, background treatment if any, position. The TEXT CONTENT itself gets REWRITTEN to fit the user's new title — but the typographic treatment stays.
+
+  • VISUAL DEVICES — arrows, strings, callouts, badges, price tags, glow effects. Drawn from `semantic_relationships` and from any `objects` entries categorized as Symbol / device. Describe the shape, color, anchor points, and what they connect.
+
+  • SUBJECT — every Person / focal object: physical attributes (age, build, hair, complexion, clothing), pose, expression. These get FRESHLY DESCRIBED based on the user's new title, NOT copied from the reference's `objects[*]` content. The reference's specific persons / weapons / badges / documents are NEVER mentioned — only their structural ROLE (centered portrait / bottom-left prop / etc.) transfers.
+
+  • TEXTURE / MATERIAL — surfaces from `objects[*].visual_attributes.texture` and `.material` ("rough corkboard texture with visible fiber grain", "weathered paper with creases").
+
+Use natural prose, not bullets. Do NOT use the words "template", "inspiration", "YouTube", "reference image", or "reference". Output ONLY the final prompt — no preamble, no reasoning labels, no commentary."""
 
 
 def _map_reference_to_title_via_gemini(
@@ -582,33 +591,46 @@ def _map_reference_to_title_via_gemini(
     style_preset: str = "person_focal",
     custom_instructions: str | None = None,
 ) -> tuple[str | None, str | None]:
-    """Single-call multimodal reasoning: Gemini sees the reference image +
-    its original title + the user's new title, walks an enumerated visual
-    checklist (embedded in the prompt) as internal chain-of-thought,
-    reasons about WHY the reference's design choices fit its title, then
-    maps that LOGIC onto the user's title.
+    """Two-step compose pipeline:
+
+      1. Vision-to-JSON — _analyze_image_via_gemini runs VisionStruct over
+         the reference and returns a rich structured breakdown (palette
+         hex codes, lighting specs, every object's location/material/
+         micro-details, exact text-overlay typography, semantic
+         relationships between elements).
+
+      2. Text-only synthesis — Gemini reads the JSON + user's title and
+         writes a self-contained image-gen prompt that bakes every
+         structural detail from the JSON into explicit prose, while
+         re-deriving every filling (person, props, text content) from
+         the new title.
+
+    Why two calls now? The downstream image generator runs PROMPT-ONLY —
+    no reference image is passed to it. That removes the img2img "copy
+    the reference" temptation that was making gpt-image-2 / Nano Banana
+    return near-identical asset swaps. To compensate for the lost visual
+    channel, the prompt has to carry every visual fact explicitly, and
+    the richest way to extract those facts is through the VisionStruct
+    pass first.
+
+    Mobile MCP timeout note: the original single-call version was 5-15s.
+    Two-step is 8-25s — still safely inside the 27s mobile timeout
+    because both Gemini calls are short (vision-JSON is heavy compute
+    on Gemini's side but returns fast; synthesis is text-only so very
+    quick). If we ever start blowing the budget we'd push synthesis to
+    a background task like the generate path.
 
     Returns (mapped_prompt, error) — prompt is None on error.
-
-    Architectural note: an earlier version split this into two calls
-    (vision-to-JSON then mapping). That blew claude.ai's ~60s MCP timeout.
-    The single-call version embeds the checklist as a mental walkthrough,
-    keeping reasoning thorough while halving latency.
     """
     if not _GEMINI_API_KEY:
         return None, "Gemini mapping disabled (GEMINI_API_KEY not set)."
 
-    # Fetch the reference image bytes for the multimodal call. Upgrades
-    # algrow CDN previews (~168×94) and YouTube hqdefaults (480×360) to
-    # maxresdefault (1280×720) where available — vision quality scales
-    # with input resolution and the algrow preview is way too small to
-    # read panel layouts, micro-details, or text.
-    img_bytes, mime_type, fetched = _fetch_image_bytes_with_fallback(reference_url)
-    if img_bytes is None:
-        return None, f"Couldn't fetch reference image: {fetched or 'all candidates failed'}"
-    logger.info(f"reasoned mapping fetched {len(img_bytes)} bytes from {fetched}")
+    # Step 1: rich vision-to-JSON extraction.
+    analysis, vision_err = _analyze_image_via_gemini(reference_url)
+    if analysis is None:
+        return None, f"Reference vision analysis failed: {vision_err or 'unknown'}"
 
-    import base64 as _b64
+    import json as _json_mod
 
     style_hint_text = {
         "person_focal": "the user's video format involves a real on-camera creator (informational only — does NOT override Rule 2. If the reference is faceless, the output stays faceless.)",
@@ -616,12 +638,15 @@ def _map_reference_to_title_via_gemini(
         "none": "no hint about the user's video format; rely entirely on the reference's structural pattern.",
     }.get(style_preset or "none", "no hint; rely entirely on the reference's structural pattern")
 
-    reference_title_str = reference_title.strip() if reference_title else "(unknown — reason from the image alone)"
+    reference_title_str = reference_title.strip() if reference_title else "(unknown — reason from the JSON alone)"
+
+    analysis_json_str = _json_mod.dumps(analysis, indent=2, ensure_ascii=False, default=str)
 
     base_prompt = _REASONED_MAP_PROMPT.format(
         title=title.strip(),
         reference_title=reference_title_str,
         style_hint=style_hint_text,
+        analysis_json=analysis_json_str,
     )
     # Custom user-supplied directives go at the very END of the prompt so
     # they have the highest salience and override the default rules where
@@ -640,13 +665,10 @@ def _map_reference_to_title_via_gemini(
             + "\n═══════════════════════════════════════════════════════════════════════════"
         )
 
+    # Step 2: text-only synthesis call. No inline_data — the JSON is in
+    # the prompt text and the model has no image to copy from.
     body = {
-        "contents": [{
-            "parts": [
-                {"text": base_prompt},
-                {"inline_data": {"mime_type": mime_type, "data": _b64.b64encode(img_bytes).decode("ascii")}},
-            ],
-        }],
+        "contents": [{"parts": [{"text": base_prompt}]}],
         "generationConfig": {
             "temperature": 0.7,
         },
@@ -659,15 +681,15 @@ def _map_reference_to_title_via_gemini(
             timeout=90,
         )
     except Exception as e:
-        return None, f"Gemini mapping request failed: {str(e)[:140]}"
+        return None, f"Gemini synthesis request failed: {str(e)[:140]}"
 
     if resp.status_code != 200:
-        return None, f"Gemini mapping HTTP {resp.status_code}: {resp.text[:200]}"
+        return None, f"Gemini synthesis HTTP {resp.status_code}: {resp.text[:200]}"
 
     try:
         out = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     except Exception as e:
-        return None, f"Couldn't parse Gemini mapping response: {str(e)[:140]}"
+        return None, f"Couldn't parse Gemini synthesis response: {str(e)[:140]}"
 
     return out, None
 
@@ -1227,7 +1249,22 @@ def _build_mcp() -> FastMCP:
                 for k, _v in oldest[: len(_ALGROW_SUBMITS) - _ALGROW_SUBMITS_MAX]:
                     _ALGROW_SUBMITS.pop(k, None)
 
-            ref_for_submit = resolved_refs[0] if resolved_refs else None
+            # Image-gen reference policy: when a reference is present we
+            # were sending it to algrow as `reference_image_url`, which
+            # puts edit-capable models (gpt-image-2 especially) into
+            # img2img mode and they end up copying the reference's
+            # subject/props verbatim and only swapping a couple of
+            # elements. The compose step now bakes the full VisionStruct
+            # breakdown of the reference into the prompt text, so the
+            # downstream model has every structural detail it needs
+            # without the visual copy temptation. Only seedream-4.5-edit
+            # actually REQUIRES a reference (it's an edit model) — keep
+            # passing it there. Everything else generates text-only.
+            ref_for_submit = (
+                resolved_refs[0]
+                if (resolved_refs and model == "seedream-4.5-edit")
+                else None
+            )
             async def _run_algrow_submit():
                 try:
                     from algrow_image import submit_image as _algrow_submit
