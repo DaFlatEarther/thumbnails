@@ -12,6 +12,7 @@ Run as remote streamable-HTTP MCP (recommended for claude.ai connectors):
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json as _json_top
 import logging
@@ -19,6 +20,7 @@ import os
 import re
 import threading
 import time
+import uuid as _uuid_top
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated
@@ -44,6 +46,23 @@ load_dotenv()
 # route.
 _GENERATED_DIR = Path(__file__).resolve().parent / "generated_images"
 _GENERATED_DIR.mkdir(exist_ok=True)
+
+# In-flight Gemini-direct generations. Keyed by task_id (prefixed with
+# "gemini:") so check_thumbnail_status can find them. Stored in process
+# memory — a uvicorn restart drops the dict, in which case status checks
+# for unknown task_ids report fail with a "server restart" message so the
+# user knows to retry rather than poll forever.
+#
+# We went async on Gemini direct because the synchronous call blocked
+# the MCP request for the full Gemini wall-clock (20-90s), which exceeds
+# the Claude mobile app's MCP request timeout. With the background task,
+# generate_thumbnail returns state=pending+task_id in under a second and
+# the widget polls via check_thumbnail_status — same pattern as the
+# algrow-backed models.
+_GEMINI_TASK_PREFIX = "gemini:"
+_GEMINI_TASKS: dict[str, dict] = {}
+# Soft cap so a long-running process doesn't grow this dict unbounded.
+_GEMINI_TASKS_MAX = 200
 
 
 _STATE_FILE = Path(__file__).resolve().parent / "widget_state.json"
@@ -1182,16 +1201,12 @@ def _build_mcp() -> FastMCP:
                 })
             return json.dumps(payload, default=str)
 
-        # Gemini direct — synchronous, one POST returns image bytes inline.
-        gem = _gemini_generate_image(
-            prompt=composed_prompt,
-            reference_urls=resolved_refs or None,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
+        # Gemini direct — kick off the actual call in a background task so
+        # the MCP request returns immediately with state=pending. The full
+        # Gemini wall-clock (20-90s) would otherwise blow the Claude
+        # mobile app's MCP request timeout. The widget polls via
+        # check_thumbnail_status which reads from _GEMINI_TASKS.
         backend_label = "gemini-3-pro-image-preview"
-        # Optional fields — only include when populated, so Claude doesn't
-        # misread null keys as failure signals.
         topic_for_outliers = outlier_topic or (prompt if find_outliers_first else None)
         if topic_for_outliers:
             payload["outlier_topic"] = topic_for_outliers
@@ -1202,34 +1217,62 @@ def _build_mcp() -> FastMCP:
         if ref_analysis_errors:
             payload["reference_analysis_errors"] = ref_analysis_errors
 
-        if gem.get("success"):
-            # Gemini returns raw bytes (we host them under /generated/);
-            # algrow returns a remote CDN URL (no bytes, already hosted).
-            # Either way the widget gets a single image URL.
-            if gem.get("image_bytes"):
-                mt = gem.get("mime_type") or "image/png"
-                ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mt, ".png")
-                fname = f"{_uuid.uuid4().hex}{ext}"
-                (_GENERATED_DIR / fname).write_bytes(gem["image_bytes"])
-                base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
-                image_url = f"{base}/generated/{fname}" if base else f"/generated/{fname}"
-            else:
-                image_url = gem.get("image_url")
-            payload.update({
-                "state": "success",
-                "images": [image_url] if image_url else [],
-                "backend": backend_label,
-                "cost_time_s": gem.get("cost_time_s"),
-            })
-            if gem.get("credits_used") is not None:
-                payload["credits_used"] = gem["credits_used"]
-        else:
-            payload.update({
-                "state": "fail",
-                "error": _friendly_error(gem.get("error") or f"{backend_label} image generation failed"),
-                "raw_error": gem.get("error"),
-                "backend": backend_label,
-            })
+        task_id = f"{_GEMINI_TASK_PREFIX}{_uuid_top.uuid4().hex}"
+        _GEMINI_TASKS[task_id] = {"state": "pending", "started_at": time.time()}
+        # Bound the dict size — drop the oldest entries when over cap.
+        if len(_GEMINI_TASKS) > _GEMINI_TASKS_MAX:
+            oldest = sorted(_GEMINI_TASKS.items(), key=lambda kv: kv[1].get("started_at", 0))
+            for k, _v in oldest[: len(_GEMINI_TASKS) - _GEMINI_TASKS_MAX]:
+                _GEMINI_TASKS.pop(k, None)
+
+        async def _run_gemini():
+            try:
+                # _gemini_generate_image is synchronous (uses requests); run
+                # it in a worker thread so the event loop stays free.
+                gem = await asyncio.to_thread(
+                    _gemini_generate_image,
+                    prompt=composed_prompt,
+                    reference_urls=resolved_refs or None,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                )
+                if gem.get("success"):
+                    if gem.get("image_bytes"):
+                        mt = gem.get("mime_type") or "image/png"
+                        ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mt, ".png")
+                        fname = f"{_uuid.uuid4().hex}{ext}"
+                        (_GENERATED_DIR / fname).write_bytes(gem["image_bytes"])
+                        base = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+                        image_url = f"{base}/generated/{fname}" if base else f"/generated/{fname}"
+                    else:
+                        image_url = gem.get("image_url")
+                    _GEMINI_TASKS[task_id] = {
+                        "state": "success",
+                        "image_url": image_url,
+                        "cost_time_s": gem.get("cost_time_s"),
+                        "finished_at": time.time(),
+                    }
+                else:
+                    _GEMINI_TASKS[task_id] = {
+                        "state": "fail",
+                        "error": _friendly_error(gem.get("error") or f"{backend_label} image generation failed"),
+                        "raw_error": gem.get("error"),
+                        "finished_at": time.time(),
+                    }
+            except Exception as e:
+                _GEMINI_TASKS[task_id] = {
+                    "state": "fail",
+                    "error": f"Gemini call threw: {str(e)[:200]}",
+                    "finished_at": time.time(),
+                }
+
+        asyncio.create_task(_run_gemini())
+
+        payload.update({
+            "state": "pending",
+            "task_id": task_id,
+            "backend": backend_label,
+        })
         return json.dumps(payload, default=str)
 
     @mcp.tool(
@@ -1268,6 +1311,38 @@ def _build_mcp() -> FastMCP:
         }
 
         # Algrow tasks have a prefixed task_id; everything else is Kie.
+        # Gemini-direct background tasks live in an in-process dict.
+        if task_id.startswith(_GEMINI_TASK_PREFIX):
+            entry = _GEMINI_TASKS.get(task_id)
+            if not entry:
+                # Unknown task — usually means uvicorn restarted and lost
+                # the dict. Tell the user clearly so they retry instead of
+                # polling against a dead reference forever.
+                payload.update({
+                    "state": "fail",
+                    "error": "Server restarted while this generation was in flight — click Generate to retry.",
+                    "backend": "gemini-3-pro-image-preview",
+                })
+                return json.dumps(payload, default=str)
+            state = entry.get("state")
+            if state == "success":
+                payload.update({
+                    "state": "success",
+                    "images": [entry["image_url"]] if entry.get("image_url") else [],
+                    "backend": "gemini-3-pro-image-preview",
+                    "cost_time_s": entry.get("cost_time_s"),
+                })
+            elif state == "fail":
+                payload.update({
+                    "state": "fail",
+                    "error": entry.get("error") or "Gemini generation failed",
+                    "raw_error": entry.get("raw_error"),
+                    "backend": "gemini-3-pro-image-preview",
+                })
+            else:
+                payload["state"] = "pending"
+            return json.dumps(payload, default=str)
+
         from algrow_image import is_algrow_task_id, check_image_status as _algrow_check
         if is_algrow_task_id(task_id):
             ar = _algrow_check(task_id)
