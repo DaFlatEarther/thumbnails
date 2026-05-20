@@ -2501,6 +2501,14 @@ let _activeDinoGame = null;
 // that finds the game already done) flushes it via performReveal().
 let _pendingThumbnail = null;
 
+// Same idea for any OTHER preview swap that wants to fire while the
+// game is running — fail messages, "Generation returned no image" hints,
+// compose errors, etc. Without buffering these, the user gets stuck
+// staring at the loader forever because _safeReplacePreview returns
+// false and the caller never retries. We park the HTML here and the
+// onGameOver hook flushes it.
+let _pendingPreviewHtml = null;
+
 // Returns true when ANY game is running — AI or human. The thumbnail
 // reveal waits for the run to end either way; autopilot watchers should
 // also get to see the run finish naturally before the canvas disappears.
@@ -2612,7 +2620,13 @@ function revealOrDeferImage(url, payload, app) {
 // path fires. Returns true if the swap happened.
 function _safeReplacePreview(html) {
   if (!preview) return false;
-  if (_gameIsRunning()) return false;
+  if (_gameIsRunning()) {
+    // Park it — onGameOver will flush. Last write wins (matches what would
+    // happen in the no-game case where each call overwrites the previous).
+    _pendingPreviewHtml = html;
+    return true;
+  }
+  _pendingPreviewHtml = null;
   preview.innerHTML = html;
   return true;
 }
@@ -2639,6 +2653,11 @@ function bootDinoIfPresent() {
         if (_pendingThumbnail) {
           const { url, payload, app } = _pendingThumbnail;
           performReveal(url, payload, app);
+        } else if (_pendingPreviewHtml != null && preview) {
+          // Fail / empty / hint message that arrived mid-run — flush it
+          // now so the player isn't stuck on the loader after dying.
+          preview.innerHTML = _pendingPreviewHtml;
+          _pendingPreviewHtml = null;
         }
       };
     } catch (err) { console.warn("dino game failed to start:", err); }
@@ -2659,6 +2678,7 @@ function setLoading(state) {
     // (installLoader is idempotent on that side) so the player's run
     // doesn't reset.
     _pendingThumbnail = null;
+    _pendingPreviewHtml = null;
     if (preview) {
       const dot = preview.querySelector(".gen-game-dot");
       if (dot) dot.classList.remove("ready");
