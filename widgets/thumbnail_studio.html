@@ -1091,6 +1091,7 @@
         <div class="dropdown-item" data-value="nano-banana-pro">Nano Banana Pro (regenerate)</div>
         <div class="dropdown-item" data-value="seedream-5.0-lite">Seedream 5.0 Lite (regenerate)</div>
         <div class="dropdown-item" data-value="seedream-4.5-edit">Seedream 4.5 Edit (preserve subject)</div>
+        <div class="dropdown-item" data-value="gpt-image-2">GPT Image 2 (regenerate)</div>
       </div>
       <input type="hidden" id="model" value="nano-banana-pro">
     </div>
@@ -1137,6 +1138,12 @@ const MODEL_META = {
     credits: 2,
     time: "20–60s",
     behavior: "EDITS the reference · preserves subject, layout, pose",
+  },
+  "gpt-image-2": {
+    label: "GPT Image 2",
+    credits: 1,
+    time: "20–50s",
+    behavior: "regenerates · cheapest option · text-to-image or image-to-image",
   },
 };
 

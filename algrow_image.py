@@ -40,6 +40,7 @@ _API_BASE = (os.environ.get("ALGROW_API_BASE_URL") or "https://api.algrow.online
 _API_KEY = (os.environ.get("ALGROW_API_KEY") or "").strip()
 
 KNOWN_MODELS = {
+    "gpt-image-2",
     "nano-banana-pro",
     "nano-banana-2",
     "seedream-4.5-edit",
