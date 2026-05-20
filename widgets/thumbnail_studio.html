@@ -804,7 +804,6 @@
   <div class="row" style="flex-wrap: wrap;">
     <button class="ref-toggle" id="ref-toggle" type="button">+ Add reference images (URLs)</button>
     <span style="flex:1;"></span>
-    <button class="ref-toggle" id="outliers-find-btn" type="button" title="Use the prompt above as the topic">🔎 Find outliers on this topic</button>
   </div>
 
   <div class="outliers-section" id="outliers-section" style="display:none;">
@@ -942,7 +941,6 @@ const refToggle = document.getElementById("ref-toggle");
 const refBox = document.getElementById("ref-box");
 const refUrlsEl = document.getElementById("ref-urls");
 const refThumbsEl = document.getElementById("ref-thumbs");
-const outliersBtn = document.getElementById("outliers-find-btn");
 const outliersSection = document.getElementById("outliers-section");
 const outliersGrid = document.getElementById("outliers-grid");
 const outliersMeta = document.getElementById("outliers-meta");
@@ -2451,14 +2449,6 @@ function render(payload, app, opts = {}) {
     if (titleEl && !titleEl.value) titleEl.value = titleVal;
     renderOutliers(payload);
 
-    // "Find outliers on this topic" only makes sense when the user is
-    // picking from a set of candidates. In single_reference mode (user
-    // pasted a specific YouTube URL via extract_reference_from_video)
-    // the reference is already chosen — exposing the find button would
-    // suggest they should second-guess it.
-    if (outliersBtn) {
-      outliersBtn.style.display = payload.single_reference ? "none" : "";
-    }
 
     // Preselect the image-gen model from the payload (Claude can hint
     // which backend to use via extract_reference_from_video's `model`
@@ -2863,42 +2853,6 @@ function initDropdowns() {
     refUrlsEl.addEventListener("paste", () => setTimeout(renderRefThumbs, 0));
   }
 
-  // Outliers: pull from algrow via the server tool, render as a clickable grid.
-  if (outliersBtn) {
-    outliersBtn.addEventListener("click", async () => {
-      const topic = promptEl.value.trim();
-      if (!topic) {
-        promptEl.focus();
-        return;
-      }
-      outliersSection.style.display = "flex";
-      outliersMeta.textContent = "searching algrow…";
-      // Algrow's semantic outlier search can take 30–60s, occasionally
-      // longer. Show the spinner + a "this takes a while" hint so the
-      // user doesn't think the widget hung.
-      outliersGrid.innerHTML = (
-        '<div style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px;">' +
-        '<div class="spinner"></div>' +
-        '<div class="hint">Searching algrow… 30–60s on cold queries.</div>' +
-        '</div>'
-      );
-      try {
-        const res = await app.callServerTool({
-          name: "find_outlier_references",
-          arguments: { topic, content_type: "longform", limit: 12 },
-        });
-        const text = res?.content?.[0]?.text ?? "";
-        const data = text ? JSON.parse(text) : null;
-        if (!data) {
-          outliersGrid.innerHTML = `<div class="err" style="padding:6px;">No response from server.</div>`;
-          return;
-        }
-        renderOutliers(data);
-      } catch (err) {
-        outliersGrid.innerHTML = `<div class="err" style="padding:6px;">${escape(err?.message || "Failed to fetch outliers")}</div>`;
-      }
-    });
-  }
   if (outliersCloseBtn) {
     outliersCloseBtn.addEventListener("click", () => {
       outliersSection.style.display = "none";
