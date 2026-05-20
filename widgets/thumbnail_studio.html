@@ -3242,7 +3242,7 @@ function initDropdowns() {
         if (!outliersGrid.querySelector(".outliers-search-overlay")) {
           const ov = document.createElement("div");
           ov.className = "outliers-search-overlay";
-          ov.innerHTML = '<span class="outliers-search-overlay-dot"></span>';
+          ov.innerHTML = '<span class="outliers-search-overlay-dot"></span><span class="outliers-search-overlay-label">Searching algrow outliers…</span>';
           outliersGrid.appendChild(ov);
         }
       }
