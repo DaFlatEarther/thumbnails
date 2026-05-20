@@ -1411,7 +1411,10 @@ async function runAutoPipeline(app, ref, title) {
     // loader, which is wrong during this step (we're engineering the
     // prompt, not painting yet). Manually disable the Generate button so
     // the visible state still reflects "work in progress".
-    if (preview) installLoader();
+    if (preview) {
+      installLoader();
+      setLoaderStatus("Generating prompt");
+    }
     generateBtn.disabled = true;
     generateBtn.textContent = "Generating…";
     let composeData = null;
@@ -1447,12 +1450,13 @@ async function runAutoPipeline(app, ref, title) {
     refreshGenerateBtn();
     saveState();
 
-    // Stage 2: generate. Use the SAME loader label that render()'s pending
-    // branch installs during polling — that way the auto-pipeline's
-    // Stage-2 placeholder and the subsequent polling loader read as one
-    // continuous "Generating thumbnail" state, rather than a misleading
-    // "Step 2/2 — Painting…" that hangs visible after the image arrives.
-    if (preview) installLoader();
+    // Stage 2: generate. Flip the corner label from "Generating prompt"
+    // → "Generating thumbnail" so the user sees the pipeline progress
+    // without the loader DOM resetting (which would reset the dino game).
+    if (preview) {
+      installLoader();
+      setLoaderStatus("Generating thumbnail");
+    }
     let genData = null;
     try {
       const res = await app.callServerTool({
@@ -1805,6 +1809,20 @@ function installLoader() {
   preview.innerHTML = loaderHtml();
 }
 
+// Update just the status text in the loader's corner overlay without
+// touching the canvas or the dino game running underneath. Used to flip
+// the label between auto-pipeline stages: "Generating prompt" during
+// compose, "Generating thumbnail" during the actual image render.
+function setLoaderStatus(text) {
+  if (!preview) return;
+  const status = preview.querySelector(".gen-game-status");
+  if (!status) return;
+  const dotNode = status.querySelector(".gen-game-dot");
+  status.textContent = "";
+  if (dotNode) status.appendChild(dotNode);
+  status.appendChild(document.createTextNode(" " + text));
+}
+
 function loaderHtml(label, sub) {
   // The loader IS the dino game. The whole preview pane becomes a runnable
   // canvas; a small DM-Sans overlay sits in the top-left with status. We
@@ -2017,12 +2035,10 @@ class DinoGame {
       if (this.score > 0 && this.score % 100 === 0) {
         this.flashScore = 24;
       }
-      // Day/night flip every 700 points.
+      // Day/night flip disabled — game stays on the light background.
+      // Milestone counter still ticks for future use but no inversion.
       if (this.score > 0 && this.score - this.lastMilestone >= 700) {
         this.lastMilestone = this.score;
-        this.night = !this.night;
-        this.nightFlash = 60;
-        this.wrap.classList.toggle("night", this.night);
       }
     }
     if (this.flashScore > 0) this.flashScore -= dt;
