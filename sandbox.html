@@ -598,6 +598,38 @@
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
     gap: 14px;
+    position: relative;     /* lets the searching overlay pin to the grid */
+    min-height: 60px;       /* keeps the spinner visible even if grid is mid-clear */
+  }
+  /* While a search is in flight: dim the existing cards and pin a centred
+     spinner over the grid. The widget keeps the old results behind it so
+     the layout doesn't collapse and reflow when the new set lands. */
+  .outliers-grid.searching > .outlier-card {
+    opacity: 0.25;
+    pointer-events: none;
+    transition: opacity 0.18s ease;
+  }
+  .outliers-search-overlay {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    z-index: 5;
+    pointer-events: none;
+    color: var(--sub);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .outliers-grid.searching > .outliers-search-overlay { display: flex; }
+  .outliers-search-overlay-dot {
+    width: 14px; height: 14px;
+    border: 2px solid rgba(255, 255, 255, 0.18);
+    border-top-color: var(--sub);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
   }
 
   /* Pager — sits below the grid when there's more than one page. Matches
@@ -1645,6 +1677,10 @@ function renderOutliers(payload) {
   if (!outliersSection || !outliersGrid) return;
   const list = Array.isArray(payload?.outliers) ? payload.outliers : [];
   outliersSection.style.display = "flex";
+  // Clear the searching-overlay state — fresh results are about to land.
+  // The actual overlay node will be wiped by renderOutlierPage's innerHTML
+  // reset or by the error/empty branches replacing the grid HTML.
+  outliersGrid.classList.remove("searching");
   // Header text differs by mode:
   //   - single_reference: just "Reference" — no count / topic / content
   //     type, those are noise when there's one pre-selected video.
@@ -3387,9 +3423,21 @@ function initDropdowns() {
       if (!newTopic) return;
       if (outliersSearchWrap) outliersSearchWrap.classList.add("searching");
       outliersSearchInput.dataset.lastSubmittedTopic = newTopic;
-      // Best-effort placeholder while we wait so the grid doesn't sit
-      // showing the old results during the round-trip.
       outliersMeta && (outliersMeta.textContent = "searching algrow…");
+      // Fade existing cards and pin a spinner over the grid for the
+      // duration of the round-trip. renderOutliers clears both when the
+      // new results land (or when an error replaces the grid HTML).
+      if (outliersGrid) {
+        outliersGrid.classList.add("searching");
+        // Insert the overlay if it isn't already there. Lives inside the
+        // grid so it absolute-positions against it.
+        if (!outliersGrid.querySelector(".outliers-search-overlay")) {
+          const ov = document.createElement("div");
+          ov.className = "outliers-search-overlay";
+          ov.innerHTML = '<span class="outliers-search-overlay-dot"></span><span>Searching algrow…</span>';
+          outliersGrid.appendChild(ov);
+        }
+      }
       try {
         const res = await app.callServerTool({
           name: "find_outlier_references",
@@ -3406,6 +3454,7 @@ function initDropdowns() {
         if (data) renderOutliers(data);
       } catch (err) {
         if (outliersSearchWrap) outliersSearchWrap.classList.remove("searching");
+        outliersGrid.classList.remove("searching");
         outliersGrid.innerHTML = `<div class="err" style="padding:6px;">${escape(err?.message || "Search failed")}</div>`;
       }
     });
