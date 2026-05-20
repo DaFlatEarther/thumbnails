@@ -678,17 +678,45 @@ def _build_reference_directives(analyses: list[dict]) -> str:
     return "\n".join(bullets)
 
 
-def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
-                                 limit: int = 12, min_outlier_score: float = 2.0
-                                 ) -> tuple[list[dict], str | None]:
-    """Server-internal call to algrow's viral-videos search.
+# Function/question words to drop when broadening a search query. Algrow's
+# semantic search returns 0 results for long YouTube-style titles even when
+# the underlying subject HAS coverage in their DB ("How Does Time Become
+# Space Inside a Black Hole" → 0; "black hole" → 12). Shortening keeps the
+# subject and drops the framing.
+_TOPIC_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "doing", "have", "has", "had", "having",
+    "how", "what", "why", "when", "where", "which", "who", "whom", "whose",
+    "of", "in", "on", "at", "to", "for", "with", "by", "from", "into",
+    "inside", "outside", "about", "as", "and", "or", "but", "if", "then",
+    "this", "that", "these", "those", "it", "its", "they", "them", "their",
+    "you", "your", "we", "our", "i", "me", "my",
+    "really", "actually", "just", "even", "ever", "always", "never",
+    "can", "could", "should", "would", "may", "might", "must", "shall", "will",
+}
 
-    Returns (outliers, error). On error, outliers is [] and error has the
-    user-facing message. Same params + same shape as find_outlier_references
-    so the two paths produce identical widget state.
+
+def _shorten_topic(topic: str, keep: int = 3) -> str:
+    """Drop common stop / question words, return the last N meaningful words.
+
+    Used as a fallback when algrow returns 0 for a verbatim title — YouTube
+    titles bury the subject under question framing, and the semantic search
+    handles bare subject nouns much better than full sentences.
+    """
+    words = re.findall(r"[A-Za-z][A-Za-z0-9'\-]*", topic or "")
+    significant = [w for w in words if w.lower() not in _TOPIC_STOPWORDS]
+    if not significant:
+        return ""
+    return " ".join(significant[-keep:])
+
+
+def _algrow_search_once(topic: str, content_type: str, limit: int,
+                        min_outlier_score: float) -> tuple[list[dict], str | None, int]:
+    """One round-trip to algrow. Returns (videos, error, count).
+    `videos` is the raw video dicts (not yet normalized to our outlier shape).
     """
     if not _ALGROW_API_KEY:
-        return [], "Algrow integration not configured (set ALGROW_API_KEY)."
+        return [], "Algrow integration not configured (set ALGROW_API_KEY).", 0
     try:
         resp = requests.post(
             f"{_ALGROW_API_BASE}/api/viral-videos/search",
@@ -707,16 +735,70 @@ def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
         )
         data = resp.json() if resp.content else {}
     except requests.exceptions.Timeout:
-        return [], "Algrow timed out (>90s). Try a more specific topic."
+        return [], "Algrow timed out (>90s). Try a more specific topic.", 0
     except Exception as e:
         logger.warning(f"algrow API call failed: {e}")
-        return [], _friendly_error(str(e))
+        return [], _friendly_error(str(e)), 0
 
     if resp.status_code != 200 or not data.get("success"):
-        return [], _friendly_error(data.get("error") or f"algrow returned HTTP {resp.status_code}")
+        return [], _friendly_error(data.get("error") or f"algrow returned HTTP {resp.status_code}"), 0
+    videos = data.get("videos") or []
+    return videos, None, int(data.get("count") or len(videos))
 
+
+def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
+                                 limit: int = 12, min_outlier_score: float = 2.0
+                                 ) -> tuple[list[dict], str | None]:
+    """Server-internal call to algrow's viral-videos search.
+
+    Returns (outliers, error). On error, outliers is [] and error has the
+    user-facing message. Same params + same shape as find_outlier_references
+    so the two paths produce identical widget state.
+
+    Falls back to shorter topic phrasings if the verbatim search returns
+    zero — algrow's semantic search struggles with long YouTube-style
+    question titles (see _shorten_topic comment).
+    """
+    if not _ALGROW_API_KEY:
+        return [], "Algrow integration not configured (set ALGROW_API_KEY)."
+
+    tried: list[str] = []
+    videos: list[dict] = []
+    last_err: str | None = None
+    # Build the fallback chain. First try verbatim; if 0 results, try the
+    # last 3 significant words, then the last 2. Dedupe + skip empties.
+    candidates = [topic.strip()]
+    for n in (3, 2):
+        short = _shorten_topic(topic, keep=n)
+        if short and short.lower() not in {c.lower() for c in candidates}:
+            candidates.append(short)
+    for q in candidates:
+        if not q:
+            continue
+        tried.append(q)
+        vids, err, count = _algrow_search_once(q, content_type, limit, min_outlier_score)
+        if err:
+            last_err = err
+            continue
+        if count > 0:
+            videos = vids
+            logger.info(f"algrow: returned {count} for q='{q}' (tried {tried})")
+            break
+
+    if not videos:
+        # No hits across the whole fallback chain. Return the most recent
+        # error if any, else a friendly "nothing matched" message.
+        if last_err:
+            return [], last_err
+        return [], (
+            f"No viral references found for any of: {', '.join(repr(q) for q in tried)}. "
+            "Try a broader 2-3 word topic (e.g. 'black hole' instead of a full question)."
+        )
+
+    # Normalize to our outlier shape. The 200/success guard already ran in
+    # _algrow_search_once, so we don't need to re-check it here.
     outliers = []
-    for v in (data.get("videos") or [])[:limit]:
+    for v in videos[:limit]:
         outliers.append({
             "video_id": v.get("video_id"),
             "title": v.get("title") or "",
