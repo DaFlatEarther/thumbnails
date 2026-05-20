@@ -1260,22 +1260,22 @@ def _build_mcp() -> FastMCP:
                 for k, _v in oldest[: len(_ALGROW_SUBMITS) - _ALGROW_SUBMITS_MAX]:
                     _ALGROW_SUBMITS.pop(k, None)
 
-            # Image-gen reference policy: when a reference is present we
-            # were sending it to algrow as `reference_image_url`, which
-            # puts edit-capable models (gpt-image-2 especially) into
-            # img2img mode and they end up copying the reference's
-            # subject/props verbatim and only swapping a couple of
-            # elements. The compose step now bakes the full VisionStruct
-            # breakdown of the reference into the prompt text, so the
-            # downstream model has every structural detail it needs
-            # without the visual copy temptation. Only seedream-4.5-edit
-            # actually REQUIRES a reference (it's an edit model) — keep
-            # passing it there. Everything else generates text-only.
-            ref_for_submit = (
-                resolved_refs[0]
-                if (resolved_refs and model == "seedream-4.5-edit")
-                else None
-            )
+            # Image-gen reference policy: pass the reference through to
+            # algrow if the caller provided one — EXCEPT for gpt-image-2,
+            # which has a strong img2img copy tendency (we've seen it
+            # near-pixel-clone the reference and only swap a couple of
+            # asset slots, ignoring the prompt's content overrides). For
+            # gpt-image-2 we rely on the VisionStruct-rich prompt alone.
+            # Seedream and nano-banana-2 are more interpretive — they
+            # use the reference as a style/palette anchor rather than a
+            # base image to edit, so the reference helps them transfer
+            # the corkboard texture / lighting / "WANTED-banner" feel
+            # without copying the subjects (the prompt's explicit content
+            # description still wins for what goes in each slot).
+            if resolved_refs and model != "gpt-image-2":
+                ref_for_submit = resolved_refs[0]
+            else:
+                ref_for_submit = None
             async def _run_algrow_submit():
                 try:
                     from algrow_image import submit_image as _algrow_submit
