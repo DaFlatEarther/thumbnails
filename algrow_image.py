@@ -37,7 +37,11 @@ import requests
 logger = logging.getLogger("algrow-image")
 
 _API_BASE = (os.environ.get("ALGROW_API_BASE_URL") or "https://api.algrow.online").rstrip("/")
-_API_KEY = (os.environ.get("ALGROW_API_KEY") or "").strip()
+# NOTE: per-user algora API key now flows in via the `api_key` arg on
+# submit_image / check_image_status (extracted from the request in
+# server.py's AuthMiddleware → auth_ctx.current_api_key). The env-var
+# fallback is gone — there is no longer a shared algora account for
+# every MCP user. See algrow-auth-byok migration notes.
 
 KNOWN_MODELS = {
     "gpt-image-2",
@@ -63,14 +67,21 @@ def is_algrow_task_id(task_id: str) -> bool:
 
 def submit_image(
     *,
+    api_key: str,
     prompt: str,
     model: str,
     aspect_ratio: str = "16:9",
     reference_url: str | None = None,
 ) -> dict[str, Any]:
-    """POST /api/generate-image — returns job_id quickly (no polling)."""
-    if not _API_KEY:
-        return {"success": False, "error": "Algrow image generation disabled (ALGROW_API_KEY not set)."}
+    """POST /api/generate-image — returns job_id quickly (no polling).
+
+    `api_key` is the per-request algora API key extracted by the auth
+    middleware (server.py → auth_ctx.current_api_key). Every generation
+    bills against THIS user's algora account, and (when they've set a
+    Kie BYOK key at algora.online/settings) algora skips its own Kie
+    credits and uses the user's key directly upstream."""
+    if not api_key:
+        return {"success": False, "error": "Algrow image generation disabled (no API key on request)."}
     if model not in KNOWN_MODELS:
         return {"success": False, "error": f"Unknown algrow model '{model}'. Allowed: {sorted(KNOWN_MODELS)}."}
     if model in REQUIRES_REFERENCE and not reference_url:
@@ -88,7 +99,7 @@ def submit_image(
         resp = requests.post(
             f"{_API_BASE}/api/generate-image",
             headers={
-                "Authorization": f"Bearer {_API_KEY}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json=body,
@@ -121,19 +132,20 @@ def submit_image(
     }
 
 
-def check_image_status(task_id: str) -> dict[str, Any]:
+def check_image_status(task_id: str, *, api_key: str) -> dict[str, Any]:
     """GET /api/job-status/:id — one round of polling.
 
     Returns {"state": "pending"|"success"|"fail", "image_url"?, "error"?}.
     Accepts a prefixed task_id (algrow:<job_id>) or a raw job_id.
-    """
-    if not _API_KEY:
-        return {"state": "fail", "error": "Algrow integration not configured."}
+
+    `api_key` is the per-request algora API key, same as submit_image."""
+    if not api_key:
+        return {"state": "fail", "error": "Algrow integration not configured (no API key on request)."}
     job_id = task_id[len(TASK_ID_PREFIX):] if task_id.startswith(TASK_ID_PREFIX) else task_id
     try:
         resp = requests.get(
             f"{_API_BASE}/api/job-status/{quote_plus(job_id)}",
-            headers={"Authorization": f"Bearer {_API_KEY}"},
+            headers={"Authorization": f"Bearer {api_key}"},
             timeout=30,
         )
     except Exception as e:

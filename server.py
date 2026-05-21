@@ -121,17 +121,13 @@ from youtube_extract import extract_video_id, extract_video_info
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("thumbnails-mcp")
 
-# Optional auth: if THUMBNAILS_MCP_TOKEN is set, require Bearer <token> on
-# /mcp. If unset, the server is open (fine for local dev / self-hosting; not
-# recommended for any deployment that pays for Kie credits).
-_REQUIRED_TOKEN = os.environ.get("THUMBNAILS_MCP_TOKEN", "").strip() or None
-
-# Optional algrow integration — when set, the find_outlier_references tool
-# is enabled and the widget shows a "Find outliers" button. The tool calls
-# algrow's public viral-videos search endpoint to surface high-outlier-score
-# thumbnails for any topic, which users can pick as references for
-# generation.
-_ALGROW_API_KEY = os.environ.get("ALGROW_API_KEY", "").strip() or None
+# Auth model: per-request algora API key, mirroring algrow-mcp. Every /mcp
+# call must carry `Authorization: Bearer algrow_<key>` (or `?key=algrow_…`
+# for connector UIs that can't set headers). AuthMiddleware extracts it
+# into auth_ctx.current_api_key; downstream tools read it from there.
+#
+# The previous shared-token model (THUMBNAILS_MCP_TOKEN) is gone — this
+# server is now exclusively for algora subscribers, no self-host mode.
 _ALGROW_API_BASE = (os.environ.get("ALGROW_API_BASE_URL") or "https://api.algrow.online").rstrip("/")
 
 # Optional Gemini vision — when set, references get auto-analyzed into a
@@ -341,21 +337,32 @@ def _analyze_image_via_gemini(image_url: str) -> tuple[dict | None, str | None]:
 
     Used by the standalone analyze_thumbnail tool and folded into
     generate_thumbnail when analyze_references=True.
+
+    Resolves Gemini key in priority order:
+      1. Per-user BYOK key from algrow_byok.get_key('gemini') — set in the
+         user's algora.online/settings/byok page. When present, this call
+         bills against the user's quota (free tier covers 15 RPM / 1500 RPD).
+      2. Shared GEMINI_API_KEY env var as fallback for backward compat
+         during the auth migration. Will be removed once every active user
+         has BYOK configured.
     """
-    if not _GEMINI_API_KEY:
-        return None, "Vision analysis disabled (GEMINI_API_KEY not set)."
+    from algrow_byok import get_key as _byok_get
+    user_gemini = _byok_get("gemini")
+    effective_key = user_gemini or _GEMINI_API_KEY
+    if not effective_key:
+        return None, "Vision analysis disabled — configure a Gemini key at https://algora.online/settings/byok"
 
     img_bytes, mime_type, fetched = _fetch_image_bytes_with_fallback(image_url)
     if img_bytes is None:
         return None, f"Couldn't fetch reference image: {fetched or 'all candidates failed'}"
-    logger.info(f"vision analysis fetched {len(img_bytes)} bytes from {fetched}")
+    logger.info(f"vision analysis fetched {len(img_bytes)} bytes from {fetched} (byok=%s)", bool(user_gemini))
 
     import base64 as _b64
     import json as _json
 
     try:
         resp = requests.post(
-            f"{_GEMINI_VISION_URL}?key={_GEMINI_API_KEY}",
+            f"{_GEMINI_VISION_URL}?key={effective_key}",
             headers={"Content-Type": "application/json"},
             json={
                 "contents": [{
@@ -621,11 +628,20 @@ def _map_reference_to_title_via_gemini(
     a background task like the generate path.
 
     Returns (mapped_prompt, error) — prompt is None on error.
-    """
-    if not _GEMINI_API_KEY:
-        return None, "Gemini mapping disabled (GEMINI_API_KEY not set)."
 
-    # Step 1: rich vision-to-JSON extraction.
+    Both the vision pass AND the synthesis call below resolve the Gemini
+    key with the same BYOK-first priority — see _analyze_image_via_gemini
+    for the rule. When the user has a Gemini key configured at
+    algora.online/settings/byok, the entire compose pipeline runs on
+    their quota and algora's shared key never sees the traffic.
+    """
+    from algrow_byok import get_key as _byok_get
+    user_gemini = _byok_get("gemini")
+    effective_key = user_gemini or _GEMINI_API_KEY
+    if not effective_key:
+        return None, "Gemini mapping disabled — configure a Gemini key at https://algora.online/settings/byok"
+
+    # Step 1: rich vision-to-JSON extraction (uses the same key — see helper).
     analysis, vision_err = _analyze_image_via_gemini(reference_url)
     if analysis is None:
         return None, f"Reference vision analysis failed: {vision_err or 'unknown'}"
@@ -675,7 +691,7 @@ def _map_reference_to_title_via_gemini(
     }
     try:
         resp = requests.post(
-            f"{_GEMINI_VISION_URL}?key={_GEMINI_API_KEY}",
+            f"{_GEMINI_VISION_URL}?key={effective_key}",
             headers={"Content-Type": "application/json"},
             json=body,
             timeout=90,
@@ -789,19 +805,26 @@ def _shorten_topic(topic: str, keep: int = 3) -> str:
 
 
 def _algrow_search_once(topic: str, content_type: str, limit: int,
-                        min_outlier_score: float, page: int = 1
+                        min_outlier_score: float, page: int = 1,
+                        *, api_key: str | None = None
                         ) -> tuple[list[dict], str | None, int, bool]:
     """One round-trip to algrow. Returns (videos, error, count, has_more).
     `videos` is the raw video dicts (not yet normalized to our outlier shape).
     `has_more` mirrors algrow's response field — True when more pages exist.
     """
-    if not _ALGROW_API_KEY:
-        return [], "Algrow integration not configured (set ALGROW_API_KEY).", 0, False
+    # Per-request algora key — pulled from the auth middleware's ContextVar
+    # when the caller didn't pass one explicitly. /mcp paths always have it
+    # set (AuthMiddleware 401s otherwise); the explicit-arg form is for
+    # tests + scripts that drive these helpers outside a request.
+    from auth_ctx import get_current_api_key
+    api_key = (api_key or get_current_api_key() or "").strip()
+    if not api_key:
+        return [], "Algrow integration not configured (no API key on request).", 0, False
     try:
         resp = requests.post(
             f"{_ALGROW_API_BASE}/api/viral-videos/search",
             headers={
-                "Authorization": f"Bearer {_ALGROW_API_KEY}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json={
@@ -829,7 +852,8 @@ def _algrow_search_once(topic: str, content_type: str, limit: int,
 
 def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
                                  limit: int = 12, min_outlier_score: float = 2.0,
-                                 page: int = 1
+                                 page: int = 1,
+                                 *, api_key: str | None = None,
                                  ) -> tuple[list[dict], str | None, str, bool]:
     """Server-internal call to algrow's viral-videos search.
 
@@ -846,8 +870,13 @@ def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
     SPECIFIC previously-effective topic, so we use it verbatim to keep
     the result set stable across pages.
     """
-    if not _ALGROW_API_KEY:
-        return [], "Algrow integration not configured (set ALGROW_API_KEY).", topic, False
+    # Same auth resolution as _algrow_search_once. We don't 401 here —
+    # surface the missing-key as a user-facing "not configured" error so
+    # the tool returns a clean grid-empty state instead of a stack trace.
+    from auth_ctx import get_current_api_key
+    api_key = (api_key or get_current_api_key() or "").strip()
+    if not api_key:
+        return [], "Algrow integration not configured (no API key on request).", topic, False
 
     tried: list[str] = []
     videos: list[dict] = []
@@ -858,7 +887,7 @@ def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
     if page > 1:
         # Pagination request — use the topic verbatim, no fallback.
         tried.append(topic.strip())
-        vids, err, count, hm = _algrow_search_once(topic.strip(), content_type, limit, min_outlier_score, page)
+        vids, err, count, hm = _algrow_search_once(topic.strip(), content_type, limit, min_outlier_score, page, api_key=api_key)
         if err:
             return [], err, topic.strip(), False
         videos = vids
@@ -875,7 +904,7 @@ def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
             if not q:
                 continue
             tried.append(q)
-            vids, err, count, hm = _algrow_search_once(q, content_type, limit, min_outlier_score, page)
+            vids, err, count, hm = _algrow_search_once(q, content_type, limit, min_outlier_score, page, api_key=api_key)
             if err:
                 last_err = err
                 continue
@@ -1185,7 +1214,9 @@ def _build_mcp() -> FastMCP:
         # widget to render.
         outliers_list: list[dict] = []
         outlier_error: str | None = None
-        if find_outliers_first and _ALGROW_API_KEY:
+        if find_outliers_first:
+            # No env-key gate — the per-request algora key (set by
+            # AuthMiddleware) is what authenticates the algrow call.
             outliers_list, outlier_error, _eff_topic, _has_more = _fetch_outliers_from_algrow(
                 topic=(outlier_topic or prompt).strip(),
             )
@@ -1276,11 +1307,19 @@ def _build_mcp() -> FastMCP:
                 ref_for_submit = resolved_refs[0]
             else:
                 ref_for_submit = None
+            # Capture the per-request algora key BEFORE spawning the bg
+            # task — the ContextVar gets reset when AuthMiddleware unwinds,
+            # which happens the instant we return the placeholder to the
+            # client. Without this snapshot the bg task would see None.
+            from auth_ctx import get_current_api_key as _get_key_snapshot
+            algrow_api_key_for_bg = _get_key_snapshot()
+
             async def _run_algrow_submit():
                 try:
                     from algrow_image import submit_image as _algrow_submit
                     sub = await asyncio.to_thread(
                         _algrow_submit,
+                        api_key=algrow_api_key_for_bg,
                         prompt=composed_prompt,
                         model=model,
                         aspect_ratio=aspect_ratio,
@@ -1346,6 +1385,14 @@ def _build_mcp() -> FastMCP:
             for k, _v in oldest[: len(_GEMINI_TASKS) - _GEMINI_TASKS_MAX]:
                 _GEMINI_TASKS.pop(k, None)
 
+        # Snapshot BYOK Gemini key (if any) BEFORE spawning the bg task —
+        # algrow_byok.get_key() reads from the request-scoped ContextVar
+        # which AuthMiddleware resets the moment we return placeholder
+        # state to the client. Without this snapshot the bg task would
+        # always see the env-fallback key.
+        from algrow_byok import get_key as _byok_get
+        _gemini_byok_key_for_bg = _byok_get("gemini")
+
         async def _run_gemini():
             try:
                 # _gemini_generate_image is synchronous (uses requests); run
@@ -1356,6 +1403,7 @@ def _build_mcp() -> FastMCP:
                     reference_urls=resolved_refs or None,
                     aspect_ratio=aspect_ratio,
                     resolution=resolution,
+                    api_key=_gemini_byok_key_for_bg,
                 )
                 if gem.get("success"):
                     if gem.get("image_bytes"):
@@ -1465,6 +1513,8 @@ def _build_mcp() -> FastMCP:
             return json.dumps(payload, default=str)
 
         from algrow_image import is_algrow_task_id, check_image_status as _algrow_check
+        from auth_ctx import get_current_api_key as _get_key
+        _api_key_for_check = _get_key()
 
         # algrow_pending:<uuid> placeholder — set when generate_thumbnail
         # backgrounded the algrow submit. Until that submit finishes we have
@@ -1495,7 +1545,7 @@ def _build_mcp() -> FastMCP:
             # state == "submitted" → fall through to algrow polling using the
             # real job_id stashed by the background submit task.
             algrow_task_id = entry["algrow_task_id"]
-            ar = _algrow_check(algrow_task_id)
+            ar = _algrow_check(algrow_task_id, api_key=_api_key_for_check)
             ar_state = ar.get("state")
             backend_label = f"algrow:{entry.get('model') or model}"
             if ar_state == "success":
@@ -1522,7 +1572,7 @@ def _build_mcp() -> FastMCP:
             return json.dumps(payload, default=str)
 
         if is_algrow_task_id(task_id):
-            ar = _algrow_check(task_id)
+            ar = _algrow_check(task_id, api_key=_api_key_for_check)
             state = ar.get("state")
             if state == "success":
                 payload.update({
@@ -1684,12 +1734,12 @@ def _build_mcp() -> FastMCP:
             }
             return json.dumps(payload, default=str)
 
-    # ----- Optional algrow-powered outlier picker --------------------------
-    # Only registered when ALGROW_API_KEY is configured. Lets the widget (and
-    # Claude, when called from chat) pull high-outlier-score thumbnails for a
-    # topic and offer them as references — same UX a competitor product
-    # ships, but powered by algrow's 50k+ channel dataset.
-    if _ALGROW_API_KEY:
+    # ----- Algrow-powered outlier picker -----------------------------------
+    # Always registered — authenticates per-request via the user's algora
+    # API key (AuthMiddleware → auth_ctx.current_api_key). Lets the widget
+    # (and Claude, when called from chat) pull high-outlier-score thumbnails
+    # for a topic and offer them as references.
+    if True:
         @mcp.tool(
             name="find_outlier_references",
             title="Find Outlier Thumbnails on a Topic",
@@ -2202,27 +2252,39 @@ class CorsMiddleware:
 
 
 class AuthMiddleware:
-    """If THUMBNAILS_MCP_TOKEN is set, require it on /mcp via EITHER:
+    """Per-request algora API-key auth, mirroring algrow-mcp/remote.py.
 
-      - HTTP header:  Authorization: Bearer <token>
-      - Query string: ?key=<token>
+    Every /mcp request must carry an algora-issued API key via EITHER:
+
+      - HTTP header:  Authorization: Bearer algrow_<key>
+      - Query string: ?key=algrow_<key>
 
     The query-string form exists because claude.ai's "Add custom connector"
-    dialog only accepts a URL + OAuth (no Authorization header field). Pasting
-    `https://host/mcp?key=<token>` lets the connector authenticate without
-    standing up a full OAuth flow. Header form is preferred for everything
-    else (curl, Claude Desktop via mcp-remote --header, etc.) because query
-    strings get logged.
-    """
+    dialog only accepts a URL + OAuth (no Authorization header field).
+    Pasting `https://host/mcp?key=algrow_…` lets that connector authenticate
+    without standing up a full OAuth flow. Header form is preferred
+    everywhere else (curl, Claude Desktop via mcp-remote --header, etc.)
+    because query strings get logged.
+
+    We don't validate the key shape here beyond non-emptiness — the first
+    real algora call (find_outlier_references, image submit, BYOK lookup)
+    will fail with a clean 401 if the key is bogus, and the user sees that
+    immediately. Keeping middleware dumb avoids a per-request algora round
+    trip just to validate auth.
+
+    The extracted key is stored in the `current_api_key` ContextVar so
+    every tool handler downstream can read it without threading it through
+    function signatures."""
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not _REQUIRED_TOKEN:
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         path = scope.get("path", "")
+        # Auth only enforced on /mcp; /health and /generated/* stay open.
         if not path.startswith("/mcp"):
             await self.app(scope, receive, send)
             return
@@ -2236,13 +2298,23 @@ class AuthMiddleware:
         from urllib.parse import parse_qs
         query_token = (parse_qs(query).get("key") or [None])[0]
 
-        supplied = header_token or query_token
-        if supplied != _REQUIRED_TOKEN:
+        supplied = (header_token or query_token or "").strip()
+        if not supplied:
             await JSONResponse(
-                {"error": "unauthorized"}, status_code=401
+                {"error": "unauthorized", "detail": "Authorization: Bearer <algora_api_key> required. Get yours at https://algora.online/settings"},
+                status_code=401,
             )(scope, receive, send)
             return
-        await self.app(scope, receive, send)
+
+        # Stash for tool handlers — see auth_ctx.py.
+        from auth_ctx import set_current_api_key
+        token = set_current_api_key(supplied)
+        logger.info(f"[Auth] path={path} key={supplied[:12]}...")
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            from auth_ctx import current_api_key
+            current_api_key.reset(token)
 
 
 # ---------------------------------------------------------------------------
