@@ -2357,10 +2357,87 @@ async def generated_image(request: Request) -> Response:
     )
 
 
+# ---------------------------------------------------------------------------
+# OAuth 2.0 discovery + flow endpoints
+# ---------------------------------------------------------------------------
+# Ported wholesale from algrow-mcp's remote.py. Lets MCP clients (Claude
+# Desktop, claude.ai, ChatGPT) auth via the standard "Connect to thumbnails"
+# button instead of forcing the user to mint + paste an algora API key.
+# The flow returns the user's existing algora API key as the OAuth
+# access_token (see oauth.py header for the full sequence).
+
+from oauth import (
+    authorize as _oauth_authorize,
+    callback as _oauth_callback,
+    approve as _oauth_approve,
+    login_email as _oauth_login_email,
+    token as _oauth_token,
+    register_client as _oauth_register_client,
+)
+
+
+async def oauth_protected_resource(request: Request) -> Response:
+    """RFC 9728 resource metadata.
+
+    Served at both /.well-known/oauth-protected-resource (root) and
+    /.well-known/oauth-protected-resource/mcp (path-mounted MCP). The /mcp
+    variant is required by MCP March 2025 auth spec for path-mounted
+    servers; without it, Claude Desktop on macOS fails OAuth discovery
+    with "invalid response" (claude.ai web tolerates the 404 and falls
+    back, Desktop does not).
+    """
+    base = os.environ.get("MCP_BASE_URL", "https://thumbnails-mcp.algrow.online")
+    path = request.url.path
+    if path.rstrip("/").endswith("/mcp"):
+        resource_url = f"{base.rstrip('/')}/mcp"
+    else:
+        resource_url = base
+    return JSONResponse({
+        "resource": resource_url,
+        "authorization_servers": [base],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": [],
+    })
+
+
+async def oauth_metadata(request: Request) -> Response:
+    """GET /.well-known/oauth-authorization-server — RFC 8414 discovery."""
+    base = os.environ.get("MCP_BASE_URL", "https://thumbnails-mcp.algrow.online")
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/oauth/authorize",
+        "token_endpoint": f"{base}/oauth/token",
+        "registration_endpoint": f"{base}/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": [],
+    })
+
+
 app = Starlette(
     routes=[
         Route("/health", health),
         Route("/generated/{filename}", generated_image),
+        # OAuth discovery — RFC 9728 + RFC 8414. Both root + /mcp path
+        # variants for Desktop/Web compat (see comments above).
+        Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
+        Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource),
+        Route("/.well-known/oauth-authorization-server", oauth_metadata),
+        Route("/.well-known/oauth-authorization-server/mcp", oauth_metadata),
+        # OAuth 2.0 flow endpoints.
+        Route("/oauth/authorize", _oauth_authorize),
+        Route("/oauth/callback", _oauth_callback),
+        Route("/oauth/approve", _oauth_approve, methods=["POST"]),
+        Route("/oauth/login-email", _oauth_login_email, methods=["POST"]),
+        Route("/oauth/token", _oauth_token, methods=["POST"]),
+        Route("/oauth/register", _oauth_register_client, methods=["POST"]),
+        # Root-level aliases — some MCP connectors hit /authorize, /token,
+        # /register directly without the /oauth prefix.
+        Route("/authorize", _oauth_authorize),
+        Route("/token", _oauth_token, methods=["POST"]),
+        Route("/register", _oauth_register_client, methods=["POST"]),
     ],
     middleware=[Middleware(CorsMiddleware), Middleware(AuthMiddleware)],
     lifespan=lifespan,
