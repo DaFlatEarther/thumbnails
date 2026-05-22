@@ -1208,6 +1208,12 @@ const composeHint = document.getElementById("compose-hint");
 // user types into the prompt textarea — at that point we can't assume the
 // directives are still consistent with what they wrote.
 let promptIsComposed = false;
+// Set when extract_reference_from_channel mounts the widget. Tells the
+// compose path (auto-pipeline AND manual Create Prompt) to route through
+// compose_channel_style_prompt instead of compose_thumbnail_prompt. Also
+// drives the "Reference" → "Channel Style Sources" header swap and the
+// all-selected default rendering in renderOutlierPage.
+let _channelStyleContext = null;   // { channel_id, channel_name, channel_handle } | null
 
 // The full picked outlier object — URL + original video title + channel etc.
 // We pass the original title to compose_thumbnail_prompt so Gemini can
@@ -1244,6 +1250,11 @@ let lastSuccessPayload = null;
 // keystroke. Loads happen async on mount and are applied progressively.
 
 let _appRef = null;  // captured during init so save/load helpers can call
+// Per-widget-mount identifier (the JSON-RPC tool-call id that mounted this
+// widget). Used to give every widget mount its own state row in the DB so
+// multiple thumbnails for the same title don't overwrite each other. Falls
+// back to a synthetic per-tab id if the host doesn't expose toolInfo.id.
+let _instanceId = null;
 
 function _stateKey(title) {
   return (title || "").trim().toLowerCase().slice(0, 200);
@@ -1258,6 +1269,7 @@ async function saveStateNow() {
       name: "save_widget_state",
       arguments: {
         key,
+        instance_id: _instanceId || undefined,
         state: {
           title: titleEl.value || "",
           prompt: promptEl?.value || "",
@@ -1271,6 +1283,7 @@ async function saveStateNow() {
           model: modelEl?.value,
           aspectRatio: aspectEl?.value,
           resolution: resolutionEl?.value,
+          channelStyleContext: _channelStyleContext,
         },
       },
     });
@@ -1291,7 +1304,7 @@ async function loadStateForTitleAsync(title) {
   try {
     const res = await _appRef.callServerTool({
       name: "load_widget_state",
-      arguments: { key },
+      arguments: { key, instance_id: _instanceId || undefined },
     });
     const text = res?.content?.[0]?.text ?? "";
     const data = text ? JSON.parse(text) : null;
@@ -1422,26 +1435,39 @@ async function runAutoPipeline(app, ref, title) {
     // loader, which is wrong during this step (we're engineering the
     // prompt, not painting yet). Manually disable the Generate button so
     // the visible state still reflects "work in progress".
+    const __isChannelStyle = ref.channel_style_mode === true;
     if (preview) {
       installLoader();
-      setLoaderStatus("Generating prompt");
+      setLoaderStatus(__isChannelStyle
+        ? "Analyzing channel style (10 thumbnails)…"
+        : "Generating prompt");
     }
     generateBtn.disabled = true;
     generateBtn.textContent = "Generating…";
     let composeData = null;
     try {
-      const res = await app.callServerTool({
-        name: "compose_thumbnail_prompt",
-        arguments: {
+      if (ref.channel_style_mode === true) {
+        // Channel-style mode: skip per-reference compose. We synthesize an
+        // exhaustive prompt from the channel's design DNA across its top-10
+        // thumbnails — no single reference, no img2img at gen time. First
+        // build can take 90-120s (10 parallel vision passes + synthesis);
+        // cache hits return in ~5-10s. Tool name + extended timeout differ
+        // from the per-reference compose path.
+        composeData = await callComposeWithPolling(app, {
+          channel_id: ref.channel_id,
+          title,
+          channel_name: ref.channel_name || "",
+          channel_handle: ref.channel_handle || undefined,
+        }, { toolName: "compose_channel_style_prompt", maxMs: 6 * 60 * 1000 });
+      } else {
+        composeData = await callComposeWithPolling(app, {
           title,
           reference_url: ref.thumbnail_url,
           reference_title: ref.title || undefined,
           style_preset: stylePreset,
           custom_instructions: (customInstructionsEl?.value || "").trim() || undefined,
-        },
-      });
-      const text = res?.content?.[0]?.text ?? "";
-      composeData = text ? JSON.parse(text) : null;
+        });
+      }
     } catch (err) {
       _safeReplacePreview(`<div class="err">Compose failed: ${escape(err.message || String(err))}</div>`);
       // Surface the failure in the compose-hint below the picker too —
@@ -1449,17 +1475,59 @@ async function runAutoPipeline(app, ref, title) {
       // without this the user would see an empty prompt and no clue why.
       if (composeHint) composeHint.textContent = `Auto-compose failed: ${err.message || String(err)}. Click Create Prompt to retry.`;
       setLoading(false);
+      // Clear the "started" marker so a refresh sees a clean slate and
+      // doesn't install a perpetual spinner. The user retries via the
+      // Create Prompt button now.
+      lastResultPayload = null;
+      await saveStateNow();
       return;
     }
     if (!composeData?.success || !composeData?.prompt) {
       _safeReplacePreview(`<div class="err">Compose returned no prompt: ${escape(composeData?.error || "unknown")}</div>`);
       if (composeHint) composeHint.textContent = `Auto-compose returned no prompt: ${composeData?.error || "unknown"}. Click Create Prompt to retry.`;
       setLoading(false);
+      lastResultPayload = null;
+      await saveStateNow();
       return;
     }
     if (promptEl) promptEl.value = composeData.prompt;
     promptIsComposed = true;
     refreshGenerateBtn();
+    // Channel-style: now that compose returned, swap the single placeholder
+    // card for the actual N source thumbnails the DNA was built from. The
+    // user gets visible feedback on WHICH videos were analyzed.
+    if (ref.channel_style_mode === true && Array.isArray(composeData.source_thumb_urls) && composeData.source_thumb_urls.length) {
+      const sourceTitles = Array.isArray(composeData.source_titles)
+        ? composeData.source_titles : [];
+      const fakeOutliers = composeData.source_thumb_urls.map((u, i) => {
+        const m = /\/vi\/([A-Za-z0-9_-]{11})\//.exec(u || "");
+        return {
+          video_id: m ? m[1] : null,
+          title: sourceTitles[i] || "",
+          thumbnail_url: u,
+          channel_name: composeData.channel_name || ref.channel_name || "",
+          channel_thumbnail: null,
+          view_count: null,
+          outlier_score: null,
+          url: m ? `https://www.youtube.com/watch?v=${m[1]}` : u,
+        };
+      });
+      renderOutliers({
+        view: "outlier_picker",
+        topic: title,
+        outliers: fakeOutliers,
+        count: fakeOutliers.length,
+        content_type: "longform",
+        channel_style_mode: true,
+        channel_id: composeData.channel_id || ref.channel_id,
+        channel_handle: ref.channel_handle,
+        channel_name: composeData.channel_name || ref.channel_name,
+        matched_thumb_url: composeData.matched_thumb_url,
+        matched_title: composeData.matched_title,
+        match_reason: composeData.match_reason,
+        title,
+      });
+    }
     saveState();
 
     // Stage 2: generate. Flip the corner label from "Generating prompt"
@@ -1471,13 +1539,30 @@ async function runAutoPipeline(app, ref, title) {
     }
     let genData = null;
     try {
+      const isChannelStyle = ref.channel_style_mode === true;
+      // Channel-style refs at gen time: matched thumb first (so single-ref
+      // models like seedream/nano-banana-2 pick the right template),
+      // remaining 9 ride along as additional style anchors for nano-banana-
+      // pro (which uses up to 14 refs collectively). The synthesis prompt
+      // still does the heavy lifting for HOW vs WHAT; refs just give the
+      // gen model visual signal it can't reconstruct from text alone.
+      let channelRefs = [];
+      if (isChannelStyle) {
+        const matched = composeData.matched_thumb_url || null;
+        const all = Array.isArray(composeData.source_thumb_urls) ? composeData.source_thumb_urls : [];
+        if (matched) {
+          channelRefs = [matched, ...all.filter((u) => u !== matched)];
+        } else {
+          channelRefs = all;
+        }
+      }
       const res = await app.callServerTool({
         name: "generate_thumbnail",
         arguments: {
           prompt: composeData.prompt,
           aspect_ratio: aspectEl?.value || "16:9",
           resolution: resolutionEl?.value || "2K",
-          reference_urls: [ref.thumbnail_url],
+          reference_urls: isChannelStyle ? channelRefs : [ref.thumbnail_url],
           style_preset: "none",
           analyze_references: false,
           model: modelEl?.value || "nano-banana-pro",
@@ -1518,10 +1603,21 @@ function renderOutliers(payload) {
   const headerTitle = outliersSection.querySelector(".outliers-header .title");
   if (headerTitle) {
     const titleNode = headerTitle.childNodes[0];
-    if (titleNode) titleNode.textContent = payload?.single_reference ? "Reference " : "Outliers on your topic ";
+    if (titleNode) titleNode.textContent = payload?.channel_style_mode
+      ? "Channel Style Sources "
+      : (payload?.single_reference ? "Reference " : "Outliers on your topic ");
   }
   if (outliersMeta) {
-    if (payload?.single_reference) {
+    if (payload?.channel_style_mode) {
+      if (payload?.matched_thumb_url) {
+        const matchedTitle = payload?.matched_title ? `"${payload.matched_title}"` : "1 of " + list.length;
+        outliersMeta.textContent = `Style template: ${matchedTitle}`;
+      } else {
+        outliersMeta.textContent = list.length > 1
+          ? `Analyzed ${list.length} thumbnails`
+          : "Analyzing…";
+      }
+    } else if (payload?.single_reference) {
       outliersMeta.textContent = "";
     } else {
       // Meta line no longer repeats the topic — the search input below it
@@ -1623,6 +1719,24 @@ function renderOutliers(payload) {
   // delegate the actual card-by-card render to renderOutlierPage().
   _outlierPagerState.list = list.filter((o) => o && o.thumbnail_url);
   _outlierPagerState.payload = payload;
+  // Mirror channel-style identity onto the module-level context. Manual
+  // Create Prompt clicks and saveState read this rather than poking the
+  // pager state. We only OVERWRITE — never clear — so a single-reference
+  // payload arriving later (e.g. a fresh non-channel flow) doesn't wipe
+  // the channel context until extract_reference_from_channel runs again.
+  if (payload?.channel_style_mode) {
+    _channelStyleContext = {
+      channel_id: payload.channel_id || _channelStyleContext?.channel_id,
+      channel_name: payload.channel_name || _channelStyleContext?.channel_name,
+      channel_handle: payload.channel_handle || _channelStyleContext?.channel_handle,
+    };
+    // Wipe the legacy reference-URL textarea — those URLs come from
+    // single-reference flows and aren't read in channel-style mode.
+    if (refUrlsEl && refUrlsEl.value) {
+      refUrlsEl.value = "";
+      try { renderRefThumbs(); } catch (_) {}
+    }
+  }
   _outlierPagerState.page = 0;
   _outlierPagerState.topic = (typeof payload?.topic === "string") ? payload.topic : "";
   _outlierPagerState.contentType = payload?.content_type || "longform";
@@ -1654,6 +1768,9 @@ function appendOutliers(payload) {
 function renderOutlierPage() {
   if (!outliersGrid) return;
   const { list, page } = _outlierPagerState;
+  // Read channel-style flag from the cached payload — clicks + card class
+  // toggling key off this. Falls back to false in the normal-outliers path.
+  const __isChannelStyle = !!_outlierPagerState.payload?.channel_style_mode;
   const totalPages = Math.max(1, Math.ceil(list.length / OUTLIER_PAGE_SIZE));
   const clampedPage = Math.min(Math.max(0, page), totalPages - 1);
   _outlierPagerState.page = clampedPage;
@@ -1663,7 +1780,11 @@ function renderOutlierPage() {
   outliersGrid.innerHTML = "";
   for (const o of slice) {
     const card = document.createElement("div");
-    card.className = "outlier-card" + (isUrlInRefs(o.thumbnail_url) ? " selected" : "");
+    // Channel-style mode: all cards are visually selected (✓) regardless
+    // of which one is the matched style template. The matched one is
+    // still surfaced via the meta line and the final prompt; the ticks
+    // are just visual confirmation that all 10 were analyzed.
+    card.className = "outlier-card" + (__isChannelStyle || isUrlInRefs(o.thumbnail_url) ? " selected" : "");
     if (o.video_id) card.dataset.videoId = o.video_id;
     card.title = `${o.title || ""}\n${o.channel_name || ""}`;
     const viewsText = fmtViews(o.view_count);
@@ -1705,6 +1826,21 @@ function renderOutlierPage() {
       </div>
     `;
     card.addEventListener("click", () => {
+      if (__isChannelStyle) {
+        // Channel-style mode: toggling is visual-only for now (each ✓ is a
+        // hint about which thumbnails fed the DNA). Phase-2 will re-run the
+        // synthesizer on the checked subset; for now we just persist the
+        // selection state so it survives reloads.
+        card.classList.toggle("selected");
+        // Stash unchecked video_ids on the pager state so saveState can
+        // pick them up; harmless if unused downstream.
+        const grid = outliersGrid;
+        const unchecked = Array.from(grid.querySelectorAll(".outlier-card:not(.selected)"))
+          .map((el) => el.dataset.videoId).filter(Boolean);
+        _outlierPagerState.channelStyleUnchecked = unchecked;
+        saveState();
+        return;
+      }
       const added = setSingleRefInUrls(o.thumbnail_url);
       // Clear .selected from every sibling card, then mark this one.
       outliersGrid.querySelectorAll(".outlier-card.selected").forEach((c) => c.classList.remove("selected"));
@@ -2620,13 +2756,18 @@ function revealOrDeferImage(url, payload, app) {
 // path fires. Returns true if the swap happened.
 function _safeReplacePreview(html) {
   if (!preview) return false;
-  if (_gameIsRunning()) {
-    // Park it — onGameOver will flush. Last write wins (matches what would
-    // happen in the no-game case where each call overwrites the previous).
-    _pendingPreviewHtml = html;
-    return true;
+  // Errors / empty states bypass the politeness park used by
+  // revealOrDeferImage. Reason: the previous behavior parked error HTML
+  // until the player died in the dino game, so the failure message only
+  // surfaced post-game-over. Users couldn't tell their generation had
+  // already failed and kept playing. Replace immediately + kill any
+  // active game so the canvas does not linger next to the error banner.
+  if (_activeDinoGame) {
+    try { _activeDinoGame.destroy(); } catch (_) {}
+    _activeDinoGame = null;
   }
   _pendingPreviewHtml = null;
+  _pendingThumbnail = null;
   preview.innerHTML = html;
   return true;
 }
@@ -2720,6 +2861,47 @@ function escape(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => (
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
   ));
+}
+
+
+// Wraps app.callServerTool(compose_thumbnail_prompt) to handle the new
+// background-submit behavior: if the response is {state: "pending"}, poll
+// check_compose_status every 2s until success/fail (or 4 min cap). Returns
+// the final payload object in the same shape the synchronous compose used
+// to return ({success: true, prompt, ...} or {success: false, error}).
+async function callComposeWithPolling(app, args, opts) {
+  const toolName = (opts && opts.toolName) || "compose_thumbnail_prompt";
+  const maxMs = (opts && opts.maxMs) || (4 * 60 * 1000);
+  const initial = await app.callServerTool({
+    name: toolName,
+    arguments: args,
+  });
+  let text = initial?.content?.[0]?.text ?? "";
+  let data = text ? JSON.parse(text) : null;
+  if (!data || data.state !== "pending" || !data.task_id) {
+    return data;  // either failed before submit or already synchronous
+  }
+  const taskId = data.task_id;
+  const startedAt = Date.now();
+  const MAX_MS = maxMs;
+  while (Date.now() - startedAt < MAX_MS) {
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      const res = await app.callServerTool({
+        name: "check_compose_status",
+        arguments: { task_id: taskId },
+      });
+      const stext = res?.content?.[0]?.text ?? "";
+      const sdata = stext ? JSON.parse(stext) : null;
+      if (!sdata) continue;
+      if (sdata.state === "success" || sdata.state === "fail") {
+        return sdata;
+      }
+    } catch (_) {
+      // Transient host error; keep polling.
+    }
+  }
+  return { success: false, error: "Compose timed out after 4 minutes" };
 }
 
 // While a generation is in flight the widget polls check_thumbnail_status.
@@ -2868,7 +3050,13 @@ function render(payload, app, opts = {}) {
     // so we'd trigger a SECOND generation (3 credits) for work already
     // done. Check the per-title server state first — if a non-pending
     // result is stored, restore it instead of re-running.
-    if (payload.auto_pipeline && payload.single_reference && Array.isArray(payload.outliers) && payload.outliers.length === 1 && titleEl?.value) {
+    // Auto-pipeline fires when (a) the classic single-reference flow with
+    // exactly one outlier, OR (b) the channel-style flow with N outliers
+    // (the placeholder-card era required N=1 — that constraint no longer
+    // holds now that the 10 thumbs ship in the initial payload).
+    const __apChannelStyle = payload.auto_pipeline && payload.channel_style_mode && Array.isArray(payload.outliers) && payload.outliers.length >= 1 && titleEl?.value;
+    const __apSingleRef    = payload.auto_pipeline && payload.single_reference && !payload.channel_style_mode && Array.isArray(payload.outliers) && payload.outliers.length === 1 && titleEl?.value;
+    if (__apChannelStyle || __apSingleRef) {
       refreshComposeRow();
       (async () => {
         const saved = await loadStateForTitleAsync(titleEl.value);
@@ -2883,6 +3071,9 @@ function render(payload, app, opts = {}) {
           if (saved.prompt && promptEl && !promptEl.value) {
             promptEl.value = saved.prompt;
             promptIsComposed = !!saved.promptIsComposed;
+        if (saved.channelStyleContext && saved.channelStyleContext.channel_id) {
+          _channelStyleContext = saved.channelStyleContext;
+        }
             refreshGenerateBtn();
           }
           if (saved.customInstructions && customInstructionsEl && !customInstructionsEl.value) {
@@ -2924,10 +3115,32 @@ function render(payload, app, opts = {}) {
             render(p, app, { skipSave: true });
             return;
           }
+          // Orphaned "started" marker: auto-pipeline began earlier and
+          // crashed/failed without ever recording a task_id or terminal
+          // state. If the marker is older than 10 minutes, it's almost
+          // certainly stale — clear it and re-fire the pipeline instead
+          // of leaving the user with a forever-spinner.
+          const STARTED_STALE_MS = 10 * 60 * 1000;
+          if (p.auto_pipeline_started && p.started_at
+              && (Date.now() - p.started_at) > STARTED_STALE_MS) {
+            lastResultPayload = null;
+            try { await saveStateNow(); } catch (_) {}
+            runAutoPipeline(app, payload.outliers[0], titleEl.value);
+            return;
+          }
           if (preview) installLoader();
           return;
         }
-        runAutoPipeline(app, payload.outliers[0], titleEl.value);
+        const refForPipeline = payload.channel_style_mode
+          ? {
+              channel_style_mode: true,
+              channel_id: payload.channel_id,
+              channel_name: payload.channel_name,
+              channel_handle: payload.channel_handle,
+              thumbnail_url: payload.outliers?.[0]?.thumbnail_url,  // arbitrary; auto-pipeline uses it only for non-channel flows
+            }
+          : payload.outliers[0];
+        runAutoPipeline(app, refForPipeline, titleEl.value);
       })();
       return;
     }
@@ -2977,6 +3190,9 @@ function render(payload, app, opts = {}) {
       if (saved.prompt && promptEl && !promptEl.value) {
         promptEl.value = saved.prompt;
         promptIsComposed = !!saved.promptIsComposed;
+        if (saved.channelStyleContext && saved.channelStyleContext.channel_id) {
+          _channelStyleContext = saved.channelStyleContext;
+        }
         refreshGenerateBtn();
       }
       if (saved.customInstructions && customInstructionsEl && !customInstructionsEl.value) {
@@ -3119,6 +3335,9 @@ function applyHostContext(ctx) {
   if (ctx?.styles?.variables && typeof applyHostStyleVariables === "function") {
     applyHostStyleVariables(ctx.styles.variables);
   }
+  // Prefer the host-provided id once it shows up; never overwrite with null.
+  const hostIid = ctx?.toolInfo?.id || ctx?.toolCallId || null;
+  if (hostIid && hostIid !== _instanceId) _instanceId = hostIid;
 }
 
 // Programmatic setter for a custom dropdown — sets the hidden input's value
@@ -3190,6 +3409,24 @@ function initDropdowns() {
 (async () => {
   const app = new App({ name: "ThumbnailStudio", version: "1.0.0" }, {}, { autoResize: true });
   _appRef = app;  // make available to save/load helpers
+  // Grab a stable per-mount id from the host. claude.ai exposes the JSON-RPC
+  // id of the tool call that mounted this widget on hostContext.toolInfo.id;
+  // that's globally unique per widget mount and survives reloads of the same
+  // chat. If the host doesn't expose it, synthesize one and cache in
+  // sessionStorage so at least it stays stable across reloads in the same tab.
+  try {
+    const ctx0 = app.getHostContext?.();
+    _instanceId = ctx0?.toolInfo?.id || ctx0?.toolCallId || null;
+  } catch (_) { _instanceId = null; }
+  if (!_instanceId) {
+    try {
+      _instanceId = sessionStorage.getItem("thumb_widget_iid");
+      if (!_instanceId) {
+        _instanceId = "iid_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
+        sessionStorage.setItem("thumb_widget_iid", _instanceId);
+      }
+    } catch (_) { /* sessionStorage blocked — leave null, server will derive from title */ }
+  }
   initDropdowns();
 
   app.ontoolresult = ({ content }) => {
@@ -3446,25 +3683,33 @@ function initDropdowns() {
     composeBtn.textContent = "Composing…";
     if (composeHint) composeHint.textContent = "Analyzing reference and engineering the prompt…";
     try {
-      const composeArgs = {
-        title,
-        reference_url: refs[0],
-        style_preset: stylePresetEl?.value || "person_focal",
-      };
-      const customInstr = (customInstructionsEl?.value || "").trim();
-      if (customInstr) composeArgs.custom_instructions = customInstr;
-      // Pass the reference's original title when we have it — gives the
-      // server-side mapping step a semantic anchor (why did THIS thumbnail
-      // work for THAT title?) before mapping to the user's NEW title.
-      if (selectedOutlier?.thumbnail_url === refs[0] && selectedOutlier?.title) {
-        composeArgs.reference_title = selectedOutlier.title;
+      let data;
+      if (_channelStyleContext && _channelStyleContext.channel_id) {
+        // Channel-style retry path: ignore refs entirely (channel-DNA has
+        // no per-reference flow), call the channel-style compose tool with
+        // the cached channel context. Same poll loop, just a different tool.
+        data = await callComposeWithPolling(app, {
+          channel_id: _channelStyleContext.channel_id,
+          title,
+          channel_name: _channelStyleContext.channel_name || "",
+          channel_handle: _channelStyleContext.channel_handle || undefined,
+        }, { toolName: "compose_channel_style_prompt", maxMs: 6 * 60 * 1000 });
+      } else {
+        const composeArgs = {
+          title,
+          reference_url: refs[0],
+          style_preset: stylePresetEl?.value || "person_focal",
+        };
+        const customInstr = (customInstructionsEl?.value || "").trim();
+        if (customInstr) composeArgs.custom_instructions = customInstr;
+        // Pass the reference's original title when we have it — gives the
+        // server-side mapping step a semantic anchor (why did THIS thumbnail
+        // work for THAT title?) before mapping to the user's NEW title.
+        if (selectedOutlier?.thumbnail_url === refs[0] && selectedOutlier?.title) {
+          composeArgs.reference_title = selectedOutlier.title;
+        }
+        data = await callComposeWithPolling(app, composeArgs);
       }
-      const res = await app.callServerTool({
-        name: "compose_thumbnail_prompt",
-        arguments: composeArgs,
-      });
-      const text = res?.content?.[0]?.text ?? "";
-      const data = text ? JSON.parse(text) : null;
       if (!data?.success || !data?.prompt) {
         if (composeHint) composeHint.textContent = `Couldn't compose prompt: ${data?.error || data?.analysis_warning || "unknown error"}`;
         composeBtn.disabled = false;
@@ -3475,6 +3720,38 @@ function initDropdowns() {
       promptIsComposed = true;
       refreshGenerateBtn();
       if (composeHint) composeHint.textContent = "Prompt ready below. Review/edit if you want, then click Generate.";
+      // Channel-style: replace the placeholder card with the analyzed thumbs.
+      if (_channelStyleContext && Array.isArray(data.source_thumb_urls) && data.source_thumb_urls.length) {
+        const sourceTitles = Array.isArray(data.source_titles) ? data.source_titles : [];
+        const fakeOutliers = data.source_thumb_urls.map((u, i) => {
+          const m = /\/vi\/([A-Za-z0-9_-]{11})\//.exec(u || "");
+          return {
+            video_id: m ? m[1] : null,
+            title: sourceTitles[i] || "",
+            thumbnail_url: u,
+            channel_name: data.channel_name || _channelStyleContext.channel_name || "",
+            channel_thumbnail: null,
+            view_count: null,
+            outlier_score: null,
+            url: m ? `https://www.youtube.com/watch?v=${m[1]}` : u,
+          };
+        });
+        renderOutliers({
+          view: "outlier_picker",
+          topic: title,
+          outliers: fakeOutliers,
+          count: fakeOutliers.length,
+          content_type: "longform",
+          channel_style_mode: true,
+          channel_id: data.channel_id || _channelStyleContext.channel_id,
+          channel_handle: _channelStyleContext.channel_handle,
+          channel_name: data.channel_name || _channelStyleContext.channel_name,
+          matched_thumb_url: data.matched_thumb_url,
+          matched_title: data.matched_title,
+          match_reason: data.match_reason,
+          title,
+        });
+      }
       composeBtn.textContent = "Recompose";
       composeBtn.disabled = false;
       // Pull the prompt textarea into view so it's obvious it got filled.

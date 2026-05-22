@@ -36,3 +36,6 @@ widget_state.json
 .uvicorn.log
 .cloudflared.log
 layout
+
+# Local patch backups
+*.bak*

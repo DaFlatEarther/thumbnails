@@ -15,6 +15,31 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json as _json_top
+
+def _tolerant_json_loads(text: str) -> dict:
+    """Parse model output as JSON, tolerating leading/trailing prose AND
+    markdown code fences. Uses JSONDecoder.raw_decode to consume the first
+    valid JSON object and ignore the rest."""
+    s = (text or "").strip()
+    # Strip ```json ... ``` fences if present
+    if s.startswith("```"):
+        s = s.split("\n", 1)[1] if "\n" in s else s
+        if s.endswith("```"):
+            s = s[:-3]
+        s = s.strip()
+    # Find first { or [ — model may prepend explanatory text
+    for i, ch in enumerate(s):
+        if ch in "{[":
+            s = s[i:]
+            break
+    try:
+        return _json_top.loads(s)
+    except _json_top.JSONDecodeError:
+        # Trailing junk — use raw_decode to consume first valid object only
+        decoder = _json_top.JSONDecoder()
+        obj, _idx = decoder.raw_decode(s)
+        return obj
+
 import logging
 import os
 import re
@@ -28,7 +53,7 @@ from typing import Annotated
 import requests
 from dotenv import load_dotenv
 from pydantic import Field
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 
 load_dotenv()
 
@@ -82,31 +107,502 @@ _ALGROW_SUBMIT_PREFIX = "algrow_pending:"
 _ALGROW_SUBMITS: dict[str, dict] = {}
 _ALGROW_SUBMITS_MAX = 200
 
+# Compose background-submit cache. compose_thumbnail_prompt_tool returns
+# pending+task_id immediately and spawns the real work as an asyncio task.
+# claude.ai's MCP client has a hard ~60s request timeout that does NOT
+# respect progress notifications, but compose with thinking=high on both
+# vision and synth passes routinely runs 60-90s. The cache decouples
+# wall-clock latency from per-request deadlines: each individual call
+# returns in <1s. The widget polls check_compose_status until the entry
+# flips to success/fail.
+_COMPOSE_PREFIX = "compose_pending:"
+_COMPOSE_PENDING: dict[str, dict] = {}
+_COMPOSE_PENDING_MAX = 200
 
-_STATE_FILE = Path(__file__).resolve().parent / "widget_state.json"
-_state_lock = threading.Lock()
-_MAX_STATE_ENTRIES = 100  # cap so the JSON file doesn't grow unbounded
+# =============================================================================
+# Channel-style DNA pipeline
+# =============================================================================
+# Build a "channel design DNA" from a creator's top-by-views thumbnails: one
+# vision-pass per thumbnail (parallel), then a synthesis step that distills
+# the recurring style across all of them and emits a text-only image prompt
+# that — applied to a NEW title — recreates the channel's look without any
+# reference image at gen time. Cached in Postgres for 30 days because (a) the
+# pipeline costs ~$0.30 in API calls and (b) a channel's style barely drifts
+# faster than that.
+
+_CHANNEL_STYLE_THUMB_COUNT = 10            # how many top thumbnails to mine
+_CHANNEL_STYLE_FETCH_BREADTH = 100         # over-fetch then sort by view_count
+_CHANNEL_DNA_TTL_DAYS = 30
+_CHANNEL_COMPOSE_PREFIX = "channel_compose_pending:"   # reuses _COMPOSE_PENDING
 
 
-def _load_state_bucket() -> dict:
-    with _state_lock:
-        if not _STATE_FILE.exists():
-            return {}
+def _resolve_channel_via_algrow(handle_or_id: str) -> tuple[dict | None, str | None]:
+    """Call algrow's /api/channels/resolve. Returns (info, error).
+    info contains at minimum: channel_id, channel_name, channel_thumbnail (avatar).
+    Reads the per-request algora API key from auth_ctx — caller must be
+    inside an AuthMiddleware-wrapped request."""
+    from auth_ctx import get_current_api_key
+    api_key = (get_current_api_key() or "").strip()
+    if not api_key:
+        return None, "Algrow integration requires an algora API key on this request."
+    s = (handle_or_id or "").strip()
+    if not s:
+        return None, "Empty channel identifier."
+    # Algrow's resolver wants the handle form (@xxx). If the user already
+    # gave a UCxxx ID, skip the resolve and just synthesize a stub — the
+    # videos endpoint takes channel_id directly.
+    if re.match(r"^UC[A-Za-z0-9_-]{22}$", s):
+        return {"channel_id": s, "channel_name": s, "channel_thumbnail": None, "handle": None}, None
+    payload_input = s if s.startswith("@") else f"@{s}"
+    try:
+        resp = requests.post(
+            f"{_ALGROW_API_BASE}/api/channels/resolve",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"input": payload_input},
+            timeout=20,
+        )
+    except Exception as e:
+        return None, f"Algrow resolve failed: {str(e)[:120]}"
+    if resp.status_code == 404:
+        return None, f"Algrow couldn't resolve {payload_input!r}. Channel may not be indexed."
+    if resp.status_code != 200:
+        return None, f"Algrow resolve HTTP {resp.status_code}: {resp.text[:160]}"
+    try:
+        data = resp.json()
+    except Exception:
+        return None, "Algrow resolve returned non-JSON."
+    if not data.get("success") and not data.get("channel_id"):
+        return None, data.get("error") or "Algrow resolve had no channel_id in payload."
+    info = {
+        "channel_id": data.get("channel_id"),
+        "channel_name": data.get("channel_name") or data.get("channel_title") or data.get("title") or payload_input,
+        "channel_thumbnail": data.get("channel_thumbnail") or data.get("avatar_url"),
+        "handle": data.get("handle") or payload_input,
+    }
+    if not info["channel_id"]:
+        return None, "Algrow resolve returned no channel_id."
+    return info, None
+
+
+def _fetch_channel_videos_via_innertube(channel_id: str, limit: int = _CHANNEL_STYLE_FETCH_BREADTH
+                                          ) -> tuple[list[dict], dict | None, str | None]:
+    """Subprocess the node bridge to scrape a channel's videos + meta via
+    Innertube. Returns (videos, channel_meta, error). channel_meta is
+    {name, avatar_url, banner_url, subscriber_count_text} or None on failure."""
+    import subprocess
+    try:
+        p = subprocess.run(
+            ["node", "/root/apps/thumbnails/extract_channel_videos.mjs",
+             channel_id, str(int(limit))],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return [], None, "Innertube scrape timed out (>60s)."
+    except Exception as e:
+        return [], None, f"Innertube scrape subprocess failed: {str(e)[:120]}"
+    if p.returncode != 0 and not p.stdout:
+        return [], None, f"Innertube scrape exited {p.returncode}: {p.stderr[:160]}"
+    try:
+        data = _json_top.loads(p.stdout.strip().split("\n")[-1])
+    except Exception:
+        return [], None, f"Innertube scrape returned non-JSON: {p.stdout[:160]}"
+    if not data.get("success"):
+        return [], None, data.get("error") or "Innertube scrape failed."
+    raw = data.get("videos") or []
+    out = []
+    for v in raw:
+        vid = v.get("video_id")
+        if not vid:
+            continue
+        out.append({
+            "video_id": vid,
+            "title": v.get("title") or "",
+            "thumbnail_url": v.get("thumbnail_url") or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+            "view_count": int(v.get("view_count") or 0),
+        })
+    meta = data.get("channel") or None
+    return out, meta, None
+
+
+def _fetch_channel_top_videos(channel_id: str, n: int = _CHANNEL_STYLE_THUMB_COUNT,
+                              *, api_key: str | None = None
+                              ) -> tuple[list[dict], str | None]:
+    """Fetch up to _CHANNEL_STYLE_FETCH_BREADTH recent videos from algrow,
+    sort by view_count desc, return top-N as [{video_id, title, thumbnail_url,
+    view_count}].
+
+    Pass `api_key` explicitly when called from a worker thread (asyncio
+    to_thread). Inside a request handler it can be omitted and we'll pull
+    it from the ContextVar — but ContextVars don't propagate into the
+    thread pool, so explicit-key is the safer default."""
+    from auth_ctx import get_current_api_key
+    api_key = (api_key or get_current_api_key() or "").strip()
+    if not api_key:
+        return [], "Algrow integration requires an algora API key on this request."
+    try:
+        resp = requests.get(
+            f"{_ALGROW_API_BASE}/api/channels/{channel_id}/videos",
+            headers={"Authorization": f"Bearer {api_key}"},
+            params={"limit": str(_CHANNEL_STYLE_FETCH_BREADTH)},
+            timeout=45,
+        )
+    except Exception as e:
+        return [], f"Algrow channel-videos fetch failed: {str(e)[:140]}"
+    if resp.status_code != 200:
+        return [], f"Algrow channel-videos HTTP {resp.status_code}: {resp.text[:160]}"
+    try:
+        data = resp.json()
+    except Exception:
+        return [], "Algrow channel-videos returned non-JSON."
+    videos = data.get("videos") or []
+    if not videos:
+        # Algrow doesn't have this channel indexed — scrape via Innertube.
+        # Returns raw videos newest-first; we'll sort by view_count below
+        # using the same code path so behaviour matches Algrow-served data.
+        logger.info(f"channel {channel_id} not in Algrow index — falling back to Innertube scrape")
+        scraped, _scr_meta, scr_err = _fetch_channel_videos_via_innertube(channel_id, _CHANNEL_STYLE_FETCH_BREADTH)
+        if not scraped:
+            return [], scr_err or "Channel has no videos in Algrow OR via Innertube."
+        videos = scraped
+    # Sort by view_count desc — channel's actual top performers
+    videos_sorted = sorted(
+        videos,
+        key=lambda v: int(v.get("view_count") or 0),
+        reverse=True,
+    )
+    out = []
+    for v in videos_sorted[:n]:
+        vid = v.get("video_id")
+        if not vid:
+            continue
+        out.append({
+            "video_id": vid,
+            "title": v.get("title") or "",
+            "thumbnail_url": v.get("thumbnail_url") or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+            "view_count": int(v.get("view_count") or 0),
+        })
+    return out, None
+
+
+def _channel_dna_load(channel_id: str) -> dict | None:
+    """Return cached DNA payload or None on miss/expired."""
+    try:
+        with _db().cursor(cursor_factory=_pg_extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT dna_json, source_thumb_urls, source_titles, source_analyses, "
+                "channel_name, channel_avatar, handle, computed_at "
+                "FROM channel_style_dna WHERE channel_id = %s AND expires_at > NOW()",
+                (channel_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            row = dict(row)
+            # Force re-vision-pass if the cache was written under the old
+            # schema and has no source_analyses — matching needs those.
+            if not row.get("source_analyses"):
+                return None
+            return row
+    except Exception as e:
+        logger.error(f"channel_dna_load DB error: {e}")
+        return None
+
+
+def _channel_dna_save(channel_id: str, handle: str | None, channel_name: str,
+                      channel_avatar: str | None, dna_json: dict | None,
+                      source_thumb_urls: list[str], source_titles: list[str],
+                      source_analyses: list[dict]) -> None:
+    try:
+        with _db().cursor() as cur:
+            cur.execute(
+                """INSERT INTO channel_style_dna
+                       (channel_id, handle, channel_name, channel_avatar, dna_json,
+                        source_thumb_urls, source_titles, source_analyses,
+                        computed_at, expires_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(),
+                           NOW() + INTERVAL '%s days')
+                   ON CONFLICT (channel_id) DO UPDATE SET
+                       handle = EXCLUDED.handle,
+                       channel_name = EXCLUDED.channel_name,
+                       channel_avatar = EXCLUDED.channel_avatar,
+                       dna_json = EXCLUDED.dna_json,
+                       source_thumb_urls = EXCLUDED.source_thumb_urls,
+                       source_titles = EXCLUDED.source_titles,
+                       source_analyses = EXCLUDED.source_analyses,
+                       computed_at = NOW(),
+                       expires_at = NOW() + INTERVAL '%s days'""",
+                (channel_id[:64], (handle or "")[:128], channel_name[:256],
+                 (channel_avatar or "")[:512] or None,
+                 _json_top.dumps(dna_json) if dna_json else None,
+                 _json_top.dumps(source_thumb_urls),
+                 _json_top.dumps(source_titles),
+                 _json_top.dumps(source_analyses),
+                 _CHANNEL_DNA_TTL_DAYS, _CHANNEL_DNA_TTL_DAYS),
+            )
+    except Exception as e:
+        logger.error(f"channel_dna_save DB error: {e}")
+
+
+_CHANNEL_DNA_SYNTHESIS_PROMPT = """ROLE & OBJECTIVE
+You are ChannelDesignMatcher. You receive (a) a user's NEW video title and (b) JSON vision analyses of N of a single creator's top-performing YouTube thumbnails. The creator does NOT have a single uniform style — different videos use different design treatments depending on topic. Your job is two-step:
+
+STEP 1 — MATCH
+From the N analyzed thumbnails, pick the SINGLE one whose design treatment would best fit the new title.
+
+ARCHETYPE GATE — do this FIRST, before any other reasoning:
+  1. In one phrase, name the user's title's natural archetype. Choose from: single_hero_object | single_hero_face | comparison_split | character_action | infographic_diagram | reaction_face | scene_panoramic | text_focal. A "single hidden discovery" title like "NASA Just Discovered a Dark Planet No One Was Supposed to See" is single_hero_object. A "X vs Y" title is comparison_split. A "How [person] did [thing]" title is character_action. A "What it's like inside [place]" title is scene_panoramic.
+  2. For each of the N candidate thumbnails, read its analysis's `composition.primary_archetype` field (or infer it from the analysis if missing).
+  3. RULE: pick ONLY from candidates whose archetype composes with the user's title's archetype. Specifically:
+       • A comparison_split candidate is INCOMPATIBLE with a single_hero_object title (and vice-versa). Comparison thumbnails imply "look at these two known things side by side" — they're wrong for a "newly discovered hidden thing" title.
+       • A reaction_face candidate is incompatible with an infographic title.
+       • A character_action candidate is incompatible with a scene_panoramic title.
+       • In general: candidates whose archetype is the same as, or a strict superset of, the user's title's archetype are compatible. Everything else is rejected.
+  4. If MULTIPLE candidates are archetype-compatible, fall through to PRIMARY SIGNAL + TIE-BREAKER below to pick among them.
+  5. If NO candidate is archetype-compatible, pick the closest archetype (e.g. for single_hero_object pick another single-hero variant rather than a comparison split). Never pick an incompatible candidate just because its topic is close — topic-close + archetype-wrong produces direct-copy outputs that violate HOW-vs-WHAT.
+
+PRIMARY SIGNAL — design treatment fit (apply ONLY to archetype-compatible candidates):
+  • Composition archetype alignment (object_hero vs face_close_up vs character_action vs split_screen / comparison vs infographic etc — match the title's natural subject class).
+  • Emotional tone alignment (the user's title's intended hook — discovery, shock, awe, curiosity, exposé — vs each thumbnail's tone).
+  • Subject framing (does the title call for a single dominant subject? a comparison of two? a scene? pick a thumbnail that frames the analogous structural subject the same way).
+
+TIE-BREAKER — topic similarity:
+When two or more candidate thumbnails have equally applicable design treatments, prefer the one whose ORIGINAL TITLE is structurally closest to the user's new title — similar phrasing pattern ("How X Did Y" vs "Why X Happened"), similar narrative hook ("just discovered", "no one knew"), similar subject class (single hidden object vs comparison of two known objects vs character-driven event). For SINGLE-GENRE channels (e.g. a channel that only does space discoveries) topic similarity is a strong positive signal because the creator uses the same design family for the same topic class on purpose.
+
+ANTI-OVERFIT GUARD — when topic similarity is wrong:
+Do NOT pick a thumbnail just because the topics are close if its design treatment is clearly wrong for the new title. For MULTI-GENRE channels (a channel that mixes politics, engineering, heists, etc.) the wrong topic match can drag you into the wrong design family. Examples of what to avoid:
+  • Picking a "How Iran's Leader Was Killed" looming-villain face composition for a "World's Deadliest Weapon" title — both are geopolitical, but the looming-face archetype doesn't fit a weapon hero shot. The right pick is a thumbnail whose archetype is object_hero / character_action, not face_close_up villain.
+  • Picking a "vs" comparison thumbnail for a single-discovery title — same niche, wrong archetype.
+
+Read the candidate thumbnails' archetypes from their analyses before deciding. If the closest-topic candidate has the right archetype, pick it. If the closest-topic candidate has a clearly wrong archetype, pick the next-best topic candidate whose archetype fits.
+
+STEP 2 — APPLY
+Take the matched thumbnail's design — its palette, typography, composition, lighting, effects vocabulary, production polish, emotional register — and write a single exhaustive image-gen prompt that recreates that exact design treatment for the new title. The image generator will receive your prompt and NO reference image; encode every visual choice in text.
+
+HARD CONSTRAINT — HOW vs WHAT
+You are transferring the matched thumbnail's design (HOW it looks), not its content (WHAT it shows). The matched thumbnail's specific subject — a named person, a named object, a recurring scene — DOES NOT carry over to the new image. The new image's subject comes from the new title, full stop. The matched thumbnail's design tells you how to render that new subject.
+
+Test for every visual element you put in the final prompt: "Would I write this same instruction even if the matched thumbnail were of a totally different topic, as long as the design treatment was identical?" If no, you're smuggling subject content where you should be carrying design choice.
+
+FORBIDDEN CONTENT TRANSFERS — hard rules:
+  • Specific NOUNS from the matched reference's analysis do NOT appear in the final prompt unless the new title independently calls for them. If the matched reference's analysis contains an Earth + a Planet, and the new title is "NASA Discovered a Dark Planet", the final prompt must NOT write "Earth", "the Earth", "a familiar Earth", or describe Earth at all — Earth was the reference's content choice for ITS comparison title, not a structural element. Same for any named-object content: a specific weapon, a specific vehicle, a specific landmark, a specific celestial body, a specific person, a specific room, a specific prop.
+  • Reference's TEXT-OVERLAY CONTENT (the literal words / labels) NEVER carry over. The text overlay's STRUCTURE transfers — count of labels, font category, weight, color, position, drop-shadow softness, letter-spacing. The actual WORDS are derived fresh from the user's new title. If the matched reference's labels were "EARTH" and "PLANET Y", do NOT write "EARTH" or "PLANET Y" as label content for the new image. Derive labels from the user's title (e.g. for "NASA Discovered a Dark Planet" → a single label like "DARK PLANET" or "DISCOVERED" or whatever the title naturally implies, NOT two labels echoing the comparison structure of the reference if the title isn't a comparison).
+  • The matched reference's SLOT COUNT (number of major subjects in the frame) does not automatically transfer. A two-object comparison reference does not force the new image to have two objects if the new title is a single-hero title. The matcher should have rejected it on archetype grounds, but as a backstop: when the new title doesn't justify the slot count, drop the extra slots and let the hero subject claim the whole frame.
+
+Concrete worked example for clarity:
+  Matched reference is "EARTH | PLANET Y" — a comparison thumbnail with Earth on the left (label "EARTH") and Planet Y on the right (label "PLANET Y"), pure black void, identical typography on both labels.
+  New title: "NASA Just Discovered a Dark Planet No One Was Supposed to See" — single_hero_object archetype.
+  CORRECT final prompt: a single dark planet as the sole hero subject claiming most of the frame, on the same pure black void, with the same dramatic key-light + rim-light treatment as the matched reference, with ONE bold all-caps white sans-serif label derived from the new title (e.g. "DARK PLANET" centered, or "HIDDEN" / "DISCOVERED" in a complementary position). Earth does NOT appear. The word "EARTH" does NOT appear. Two-label comparison structure does NOT appear.
+  WRONG final prompt (this is what we got last time and we are NOT doing it again): "place a familiar Earth as the scale anchor on the left… the label EARTH in the top-left… cool blues of Earth contrasting against…" — every Earth reference is content smuggling from the matched reference's title.
+
+REFERENCE-AWARE PROMPT
+Downstream gen receives your prompt AND the N reference images attached as visual input. Reference image 1 is the MATCHED THUMBNAIL — the one you picked in STEP 1. References 2..N are the other top-by-views thumbnails from the same channel, included as additional style anchors.
+
+Phrase the final prompt in directive language that names the references explicitly so the gen model knows what role each one plays. Examples of the right shape:
+  • "Match reference image 1's composition exactly — the looming foreground subject and the smaller hero object below."
+  • "Lift the lighting setup from reference image 1: dramatic top-down rim light with deep underexposed shadows."
+  • "Use the exact palette and typography treatment shown in reference image 1 (red `#FF0000` accent on near-black `#121212`, bold all-caps sans-serif white text in a solid red bar)."
+  • "References 2-N show the channel's broader style range — confirm the palette and effect vocabulary from them, but DO NOT copy any of their subjects."
+
+You can still include concrete hex codes, font specs, bbox coords, and lighting params alongside the directive language — the gen model benefits from both. But the prompt's load-bearing instructions should ANCHOR ON the reference images, not pretend they don't exist.
+
+CRITICAL: even though the references carry strong visual information, the HOW-vs-WHAT rule still applies. The subject in your new image comes 100% from the new title. The references provide HOW to render that subject; they do NOT provide WHAT to render. The matched reference's specific person / brand / object DOES NOT carry over.
+
+OUTPUT FORMAT — STRICT
+Return ONLY a single JSON object. No markdown fencing, no preamble. Schema:
+{
+  "matched_index": <integer 0..N-1>,
+  "matched_title": "<exact text of the matched thumbnail's original title>",
+  "match_reason": "<one sentence explaining WHY this thumbnail's design treatment fits the new title — focus on design rationale, not topic similarity>",
+  "channel_constants_lift": "<short list of channel-wide design constants you observed across all N thumbnails (palette, typography, production polish) that should override the matched thumbnail's value if they differ — only include things that ARE truly consistent across all N>",
+  "final_prompt": "<ONE continuous prose paragraph, 500-1200 words, no markdown headings or bullet lists, that the image generator will receive verbatim ALONGSIDE the reference images. Phrase it as reference-aware directives: 'match reference image 1's composition', 'lift the lighting from reference image 1', 'use the palette and typography shown in reference image 1'. References 2-N (the other 9 channel thumbnails) are style anchors — confirm palette/effects but do not copy their subjects. The image's subject comes 100% from the new title; include the exact new-title text inside quotes for the typography spec. Embed concrete values (hex codes, font specs, bbox coords) alongside the reference-anchored directives — both layers help the gen model.>"
+}
+
+Be decisive on the match — pick one index. If two thumbnails feel equally applicable, pick the one with stronger design treatment (more distinctive lighting / clearer subject framing / more memorable color choice). Never blend two; that's averaging, which is what we're explicitly avoiding.
+"""
+
+
+def _build_matched_prompt(analyses: list[dict], titles: list[str],
+                          thumb_urls: list[str], new_title: str,
+                          channel_name: str, channel_handle: str | None,
+                          *, gemini_key: str | None = None
+                          ) -> tuple[dict | None, str | None]:
+    """Single Gemini call that picks the best-matching analyzed thumbnail
+    for the new title and applies its design to that title. Returns
+    (result_dict, error). On success result_dict contains:
+        matched_index, matched_title, matched_thumb_url, match_reason,
+        channel_constants_lift, final_prompt
+
+    BYOK-aware: pass `gemini_key` from the request context when calling
+    via asyncio.to_thread; falls back to the per-user BYOK key or the
+    shared env var when omitted (matches _analyze_image_via_gemini)."""
+    if not gemini_key:
         try:
-            return _json_top.loads(_STATE_FILE.read_text(encoding="utf-8")) or {}
+            from algrow_byok import get_key as _byok_get
+            gemini_key = _byok_get("gemini") or _GEMINI_API_KEY
         except Exception:
-            return {}
+            gemini_key = _GEMINI_API_KEY
+    if not gemini_key:
+        return None, "Gemini key not configured — set one at https://algora.online/settings/byok"
+    if not analyses:
+        return None, "No analyses to match against."
+
+    # Build the input. Each analysis is paired with its title and index so
+    # the model can refer to them unambiguously.
+    indexed = []
+    for i, (a, t) in enumerate(zip(analyses, titles)):
+        indexed.append({"index": i, "original_title": t, "analysis": a})
+
+    user_text = (
+        f"CHANNEL: {channel_name}"
+        + (f" ({channel_handle})" if channel_handle else "")
+        + f"\nNEW TITLE: {new_title}\n"
+        + f"N = {len(indexed)} thumbnails to choose from. Pick exactly one by index.\n"
+        + f"ANALYZED THUMBNAILS:\n"
+        + _json_top.dumps(indexed, default=str)
+    )
+
+    flash_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={gemini_key}"
+    try:
+        resp = requests.post(
+            flash_url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{
+                    "parts": [
+                        {"text": _CHANNEL_DNA_SYNTHESIS_PROMPT},
+                        {"text": user_text},
+                    ],
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "temperature": 0.3,
+                    "thinkingConfig": {"thinkingLevel": "high"},
+                },
+            },
+            timeout=240,
+        )
+    except Exception as e:
+        return None, f"Gemini match+apply request failed: {str(e)[:160]}"
+    if resp.status_code != 200:
+        return None, f"Gemini match+apply HTTP {resp.status_code}: {resp.text[:200]}"
+    try:
+        body = resp.json()
+        text = body["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = _tolerant_json_loads(text)
+    except Exception as e:
+        return None, f"Couldn't parse match+apply response: {str(e)[:160]}"
+
+    idx = parsed.get("matched_index")
+    final_prompt = parsed.get("final_prompt")
+    if idx is None or not isinstance(idx, int) or not (0 <= idx < len(analyses)):
+        return None, f"Match step returned invalid index {idx!r}."
+    if not final_prompt:
+        return None, "Match step returned no final_prompt."
+
+    return {
+        "matched_index": idx,
+        "matched_title": parsed.get("matched_title") or titles[idx],
+        "matched_thumb_url": thumb_urls[idx],
+        "match_reason": parsed.get("match_reason") or "",
+        "channel_constants_lift": parsed.get("channel_constants_lift") or "",
+        "final_prompt": final_prompt,
+    }, None
 
 
-def _save_state_bucket(bucket: dict) -> None:
-    with _state_lock:
-        tmp = _STATE_FILE.with_suffix(".json.tmp")
-        tmp.write_text(_json_top.dumps(bucket), encoding="utf-8")
-        tmp.replace(_STATE_FILE)
+
+# Widget state used to live in widget_state.json next to this file. That
+# broke when a user generated multiple thumbnails for the same title in
+# one chat (each save overwrote the prior under the same title key), and
+# on reopen older widget mounts showed blank instead of their own image.
+# Storage is now a Postgres table keyed by instance_id (the JSON-RPC id
+# of the tool call that mounted the widget), which is globally unique
+# per widget mount. The title_key is still indexed so the chat-side
+# "use my prior reference for this title" lookup keeps working — it
+# resolves to the most recently updated row for that title.
+import psycopg2 as _pg
+import psycopg2.extras as _pg_extras
+
+_DB_URL = os.environ.get("DATABASE_URL")
+_db_conn_lock = threading.Lock()
+_db_conn = None  # lazy singleton; reconnected on broken-pipe
+
+def _db():
+    """Lazily return a live psycopg2 connection. Reconnect on errors so the
+    long-lived MCP process survives transient DB blips."""
+    global _db_conn
+    if not _DB_URL:
+        raise RuntimeError("DATABASE_URL not configured for widget state.")
+    with _db_conn_lock:
+        if _db_conn is not None:
+            try:
+                _db_conn.cursor().execute("SELECT 1")
+                return _db_conn
+            except Exception:
+                try: _db_conn.close()
+                except Exception: pass
+                _db_conn = None
+        _db_conn = _pg.connect(_DB_URL)
+        _db_conn.autocommit = True
+        return _db_conn
 
 
 def _state_key(s: str | None) -> str:
     return (s or "").strip().lower()[:200]
+
+
+def _state_load_by_instance(instance_id: str) -> dict | None:
+    with _db().cursor(cursor_factory=_pg_extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT state FROM widget_thumbnail_states WHERE instance_id = %s",
+            (instance_id,),
+        )
+        row = cur.fetchone()
+        return row["state"] if row else None
+
+
+def _state_load_latest_by_title(title_key: str) -> dict | None:
+    with _db().cursor(cursor_factory=_pg_extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT state FROM widget_thumbnail_states
+               WHERE title_key = %s
+               ORDER BY updated_at DESC LIMIT 1""",
+            (title_key,),
+        )
+        row = cur.fetchone()
+        return row["state"] if row else None
+
+
+def _state_save(instance_id: str, title_key: str, state: dict) -> None:
+    with _db().cursor() as cur:
+        cur.execute(
+            """INSERT INTO widget_thumbnail_states (instance_id, title_key, state, updated_at)
+               VALUES (%s, %s, %s, NOW())
+               ON CONFLICT (instance_id) DO UPDATE
+                   SET state = EXCLUDED.state,
+                       title_key = EXCLUDED.title_key,
+                       updated_at = NOW()""",
+            (instance_id[:128], title_key[:256], _json_top.dumps(state)),
+        )
+
+# Legacy file-backed helpers kept as read-only fallback for the one release
+# where some clients might still call without instance_id. After ~2 weeks,
+# delete _load_state_bucket and the widget_state.json file.
+_STATE_FILE = Path(__file__).resolve().parent / "widget_state.json"
+_MAX_STATE_ENTRIES = 100
+
+
+def _load_state_bucket() -> dict:
+    """DEPRECATED: read-only fallback. Returns the legacy JSON file contents
+    so any code path still using the old per-title bucket sees something."""
+    if not _STATE_FILE.exists():
+        return {}
+    try:
+        return _json_top.loads(_STATE_FILE.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -137,7 +633,7 @@ _ALGROW_API_BASE = (os.environ.get("ALGROW_API_BASE_URL") or "https://api.algrow
 # spelling out the design rules explicitly forces it to keep the layout
 # and only swap the subject content.
 _GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip() or None
-_GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-flash").strip()
+_GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-3-flash-preview").strip()
 _GEMINI_VISION_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
     f"{_GEMINI_VISION_MODEL}:generateContent"
@@ -182,91 +678,7 @@ _FRIENDLY_ERROR_PATTERNS = (
 # Vision-to-JSON: reference image → structured design breakdown
 # ---------------------------------------------------------------------------
 
-_VISION_TO_JSON_PROMPT = """ROLE & OBJECTIVE
-You are VisionStruct, an advanced Computer Vision & Data Serialization Engine. Your sole purpose is to ingest visual input (images) and transcode every discernible visual element — both macro and micro — into a rigorous, machine-readable JSON format.
-
-CORE DIRECTIVE
-Do not summarize. Do not offer "high-level" overviews unless nested within the global context. You must capture 100% of the visual data available in the image. If a detail exists in pixels, it must exist in your JSON output. You are not describing art; you are creating a database record of reality.
-
-ANALYSIS PROTOCOL
-Before generating the final JSON, perform a silent "Visual Sweep" (do not output this):
-  • Macro Sweep: scene type, global lighting, atmosphere, primary subjects.
-  • Micro Sweep: textures, imperfections, background clutter, reflections, shadow gradients, OCR text.
-  • Relationship Sweep: spatial + semantic connections between objects (holding, obscuring, next to, supporting, casting shadow on, visually similar to).
-
-OUTPUT FORMAT (STRICT)
-Return ONLY a single valid JSON object. No markdown fencing (no ```json), no preamble, no commentary. Use this schema, expanding arrays as needed to cover every detail:
-
-{
-  "meta": {
-    "image_quality": "Low | Medium | High",
-    "image_type": "Photo | Illustration | Diagram | Screenshot | Composite | Other",
-    "resolution_estimation": "approximate dimensions if discernible, else null"
-  },
-  "global_context": {
-    "scene_description": "comprehensive, objective paragraph describing the entire scene",
-    "time_of_day": "specific time or lighting condition, or null",
-    "weather_atmosphere": "Foggy | Clear | Rainy | Chaotic | Serene | Studio | Other",
-    "lighting": {
-      "source": "Sunlight | Artificial | Mixed | Ambient",
-      "direction": "Top-down | Backlit | Side-lit | Rim-lit | Front | Diffused | Other",
-      "quality": "Hard | Soft | Diffused",
-      "color_temp": "Warm | Cool | Neutral"
-    }
-  },
-  "color_palette": {
-    "dominant_hex_estimates": ["#RRGGBB", "#RRGGBB"],
-    "accent_colors": ["color name", "color name"],
-    "contrast_level": "High | Medium | Low"
-  },
-  "composition": {
-    "camera_angle": "Eye-level | High-angle | Low-angle | Macro | Aerial | Dutch",
-    "framing": "Close-up | Medium-shot | Wide-shot | Extreme close-up",
-    "depth_of_field": "Shallow | Deep | Tilt-shift",
-    "focal_point": "the primary element drawing the eye"
-  },
-  "objects": [
-    {
-      "id": "obj_001",
-      "label": "primary object name",
-      "category": "Person | Vehicle | Furniture | Animal | Text | Symbol | Other",
-      "location": "Center | Top-Left | Top-Right | Bottom-Left | Bottom-Right | Mid-Left | Mid-Right",
-      "prominence": "Foreground | Midground | Background",
-      "visual_attributes": {
-        "color": "detailed color description",
-        "texture": "Rough | Smooth | Metallic | Fabric-* | Skin | Other",
-        "material": "Wood | Plastic | Metal | Skin | Paper | Digital | Other",
-        "state": "Damaged | New | Wet | Dirty | Pristine | Worn",
-        "dimensions_relative": "tiny | small | medium | large | dominant relative to frame"
-      },
-      "micro_details": [
-        "specific small details only visible on close inspection"
-      ],
-      "pose_or_orientation": "Standing | Tilted | Facing-camera | Facing-away | Other",
-      "text_content": null
-    }
-  ],
-  "text_ocr": {
-    "present": true,
-    "content": [
-      {
-        "text": "exact text content",
-        "location": "where it appears (sign, overlay, t-shirt, etc.)",
-        "font_style": "Serif | Sans-serif | Display | Handwritten | Bold | Italic | Condensed",
-        "legibility": "Clear | Partially obscured | Stylized"
-      }
-    ]
-  },
-  "semantic_relationships": [
-    "Object A holding Object B",
-    "Object C casting shadow on Object A"
-  ]
-}
-
-CRITICAL CONSTRAINTS
-  • Granularity: never write "a crowd of people". Instead, list the crowd as one group object, then list distinct visible individuals as sub-objects or via detailed attributes (clothing color, action).
-  • Micro-details: scratches, dust, weather wear, fabric folds, lighting gradients — all noted.
-  • Null values: if a field is not applicable, set it to null. Don't omit fields. Schema stability matters."""
+_VISION_TO_JSON_PROMPT = open("/root/apps/thumbnails/vision_prompt_v2.txt").read()
 
 
 # Algrow's CDN serves tiny preview thumbnails (~168×94) — fine for the
@@ -374,9 +786,10 @@ def _analyze_image_via_gemini(image_url: str) -> tuple[dict | None, str | None]:
                 "generationConfig": {
                     "responseMimeType": "application/json",
                     "temperature": 0.2,
+                    "thinkingConfig": {"thinkingLevel": "high"},
                 },
             },
-            timeout=90,
+            timeout=180,
         )
     except Exception as e:
         return None, f"Gemini vision request failed: {str(e)[:140]}"
@@ -570,7 +983,16 @@ The GRAMMAR (slot positions, lighting style, palette family, font weight, visual
 STEP 3 — WRITE THE OUTPUT.
 Output ONE polished image-generation prompt: a single natural-language paragraph, ~300–450 words.
 
-CRITICAL: the prompt will be sent to the image-gen model TEXT-ONLY. No reference image is attached. EVERY visual fact must be made explicit IN THE PROMPT TEXT, pulled from the JSON breakdown above. Do NOT write "as in the reference image", "matching the reference's palette", "in the same style as the reference" — there is no reference at generation time, those phrases tell the model nothing.
+CRITICAL: the prompt is sent to the image-gen model ALONGSIDE the reference image attached as visual input. The reference image is the load-bearing source for HOW the new image should look — palette, lighting, composition, typography treatment, effects. Phrase your prompt to ANCHOR ON the reference where it carries information better than words can:
+
+  • DO write: "Match the lighting setup of the reference image exactly — same top-down warm key with deep shadow density and the same rim-light separation on the subject."
+  • DO write: "Use the same palette and contrast level as the reference (dominated by `#8B4513` warm brown, `#E63946` alarm red, `#2B2B2B` near-black)."
+  • DO write: "Apply the reference's typography treatment to the new headline — same bold display sans-serif, same all-caps, same drop-shadow softness."
+  • DO write: "Follow the reference's compositional slot positions: centered hero portrait, text overlay top-third, visual device anchored bottom-right."
+
+DO NOT pretend the reference doesn't exist by encoding every fact in self-contained prose alone. The reference image is the strongest signal the gen model has; your prompt should LEVERAGE it.
+
+You still need to be EXPLICIT about everything the reference doesn't unambiguously convey — most importantly the NEW SUBJECT (the title's filling that replaces the reference's specific person/brand/object). The HARD RULES above still apply: the reference's compositional slots transfer, the FILLINGS get re-derived from the user's title. Describe the new subject in concrete physical descriptors, never names.
 
 Specifically you MUST explicitly describe in the prompt:
 
@@ -588,7 +1010,72 @@ Specifically you MUST explicitly describe in the prompt:
 
   • TEXTURE / MATERIAL — surfaces from `objects[*].visual_attributes.texture` and `.material` ("rough corkboard texture with visible fiber grain", "weathered paper with creases").
 
-Use natural prose, not bullets. Do NOT use the words "template", "inspiration", "YouTube", "reference image", or "reference". Output ONLY the final prompt — no preamble, no reasoning labels, no commentary."""
+Use natural prose, not bullets. Avoid the words "template", "inspiration", "YouTube". You MAY (and SHOULD) use the word "reference" / "reference image" — it tells the gen model how to read the attached visual. Output ONLY the final prompt — no preamble, no reasoning labels, no commentary.
+
+=======================================================================
+TWO-STAGE OUTPUT FORMAT — STRICT
+=======================================================================
+
+Your response must follow this exact two-section structure. The downstream
+parser will discard everything outside the IMAGE PROMPT section, but the
+TRANSLATION TABLE is required because it forces you to commit to a
+per-element justification BEFORE you write the final prompt. Without it,
+on hard cases you skip the reasoning and fall back to surface-level copying.
+
+STEP 1 - Output a TRANSLATION TABLE. One entry per object in the reference
+JSON (use the obj_id). For each one, fill THREE lines:
+
+  obj_001 (short label from the JSON):
+    REFERENCE ROLE: why this element was in service of the REFERENCE's
+      original title - what concept of that title it visualized. Read
+      it from the JSON's semantic_role_in_reference_title field; if that
+      field is missing, infer it from design_function + the reference
+      title context. Be concrete: NOT the focal subject - that is
+      structural, not semantic. SEMANTIC means what idea of the title
+      does it embody.
+    NEW MAPPING: WHAT element of the USER'S new title needs to fill the
+      same semantic role. State it as a concrete description (who/what/
+      where, period, profession, props), derived ONLY from the user's
+      title - never copied from the reference's content.
+
+STEP 2 - Then output the FINAL IMAGE PROMPT, using the mappings you just
+committed to. Wrap it between the markers below EXACTLY (the parser
+extracts content between these markers):
+
+=== IMAGE PROMPT ===
+<the full natural-language image-gen prompt, written under all the
+HARD RULES above. Use the NEW MAPPINGS from STEP 1, not the reference's
+original fillings. No preamble, no explanation, no labels - just the
+prompt the image model will render.>
+=== END IMAGE PROMPT ===
+
+Example shape (truncated):
+
+  STEP 1 - TRANSLATION TABLE
+  obj_001 (woman in red hoodie, center frame):
+    REFERENCE ROLE: the relatable everyday viewer figure who validates the
+      surprise - what the title's hidden discovery feels like through a
+      normal person's reaction
+    NEW MAPPING: an older funeral director in his 60s, somber black suit,
+      composed expression - the trusted insider figure who knows the
+      hidden economics of his trade
+
+  obj_002 (red circle highlight on phone screen):
+    REFERENCE ROLE: visual punctuation on the surprising element being
+      revealed - directs the eye to where the title's payoff lives
+    NEW MAPPING: red circle highlight on a tombstone in the background with
+      a dollar sign overlay - directs the eye to the unexpected profit
+      source the title teases
+
+  ... (one entry per reference object)
+
+  === IMAGE PROMPT ===
+  A high-quality 16:9 composite thumbnail showing an older funeral
+  director ... (full prompt continues here, never naming real people
+  or brands per Rule 5, applying every HARD RULE above, using hex
+  colors and concrete physical descriptors throughout).
+  === END IMAGE PROMPT ===
+"""
 
 
 def _map_reference_to_title_via_gemini(
@@ -612,13 +1099,15 @@ def _map_reference_to_title_via_gemini(
          re-deriving every filling (person, props, text content) from
          the new title.
 
-    Why two calls now? The downstream image generator runs PROMPT-ONLY —
-    no reference image is passed to it. That removes the img2img "copy
-    the reference" temptation that was making gpt-image-2 / Nano Banana
-    return near-identical asset swaps. To compensate for the lost visual
-    channel, the prompt has to carry every visual fact explicitly, and
-    the richest way to extract those facts is through the VisionStruct
-    pass first.
+    Why two calls? The vision pass extracts a rich structured breakdown
+    of the reference (palette / lighting / composition / per-object
+    placements / text-overlay typography) that the synthesizer reasons
+    over to identify the design GRAMMAR vs the topic-specific FILLINGS.
+    The image generator then receives the engineered prompt ALONGSIDE
+    the reference image as visual input — so the prompt is phrased as
+    reference-aware directives ("match the reference's lighting", "lift
+    the typography treatment") rather than self-contained prose. The
+    reference carries HOW; the prompt re-derives WHAT from the title.
 
     Mobile MCP timeout note: the original single-call version was 5-15s.
     Two-step is 8-25s — still safely inside the 27s mobile timeout
@@ -642,7 +1131,10 @@ def _map_reference_to_title_via_gemini(
         return None, "Gemini mapping disabled — configure a Gemini key at https://algora.online/settings/byok"
 
     # Step 1: rich vision-to-JSON extraction (uses the same key — see helper).
+    import time as _t1
+    _vt0 = _t1.monotonic()
     analysis, vision_err = _analyze_image_via_gemini(reference_url)
+    logger.info(f"compose: vision pass took {_t1.monotonic()-_vt0:.1f}s")
     if analysis is None:
         return None, f"Reference vision analysis failed: {vision_err or 'unknown'}"
 
@@ -687,14 +1179,17 @@ def _map_reference_to_title_via_gemini(
         "contents": [{"parts": [{"text": base_prompt}]}],
         "generationConfig": {
             "temperature": 0.7,
+            "thinkingConfig": {"thinkingLevel": "high"},
         },
     }
+    logger.info("compose: starting synth pass")
+    _st0 = _t1.monotonic()
     try:
         resp = requests.post(
             f"{_GEMINI_VISION_URL}?key={effective_key}",
             headers={"Content-Type": "application/json"},
             json=body,
-            timeout=90,
+            timeout=180,
         )
     except Exception as e:
         return None, f"Gemini synthesis request failed: {str(e)[:140]}"
@@ -704,9 +1199,21 @@ def _map_reference_to_title_via_gemini(
 
     try:
         out = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Extract only the IMAGE PROMPT section. Two-stage output puts the
+        # per-element TRANSLATION TABLE first and the final prompt between
+        # === IMAGE PROMPT === and === END IMAGE PROMPT === markers. Fall
+        # back to the full text if markers aren't present (graceful with
+        # older synthesis prompts during the deploy window).
+        import re as _re
+        m = _re.search(r"=== IMAGE PROMPT ===\s*(.*?)\s*=== END IMAGE PROMPT ===", out, _re.DOTALL)
+        if m:
+            out = m.group(1).strip()
+        elif "=== IMAGE PROMPT ===" in out:
+            out = out.split("=== IMAGE PROMPT ===", 1)[1].strip()
     except Exception as e:
         return None, f"Couldn't parse Gemini synthesis response: {str(e)[:140]}"
 
+    logger.info(f"compose: synth pass took {_t1.monotonic()-_st0:.1f}s output_chars={len(out)}")
     return out, None
 
 
@@ -835,7 +1342,7 @@ def _algrow_search_once(topic: str, content_type: str, limit: int,
                 "min_outlier_score": min_outlier_score,
                 "page": max(1, int(page)),
             },
-            timeout=90,
+            timeout=180,
         )
         data = resp.json() if resp.content else {}
     except requests.exceptions.Timeout:
@@ -1183,10 +1690,23 @@ def _build_mcp() -> FastMCP:
             "a reference and doesn't want to re-pick. Phrasings that "
             "trigger this: 'use seedream again', 'try with gpt-image-2', "
             "'redo it but [X]', 'regenerate with [model]'.\n\n"
+            "REFERENCE-URL RULE (CRITICAL): if the user supplies ANY reference URL "
+            "(YouTube link, audio.algrow.online mirror, raw .jpg/.png/.webp, "
+            "i.ytimg.com URL, anything visual) DO NOT call generate_thumbnail "
+            "directly with a hand-written prompt. Route through the widget's "
+            "auto-compose pipeline instead:\n"
+            "  • YouTube URL / 11-char ID → call `extract_reference_from_video` "
+            "with `user_title`. The widget will compose + generate automatically.\n"
+            "  • Direct image URL (R2 mirror, raw .jpg/.png, any non-YouTube image) "
+            "→ call `extract_reference_from_image` with `user_title`. Same auto-pipeline.\n"
+            "Calling generate_thumbnail directly with a reference URL skips the "
+            "vision-analysis step that translates the reference's design DNA into "
+            "a tailored prompt, producing a generic free-text result.\n\n"
             "Reference images work powerfully — pass up to 8 URLs via "
             "`reference_urls` (YouTube watch/shorts/embed/live URLs, raw 11-char "
             "video IDs, i.ytimg.com URLs, and direct image URLs are all accepted; "
-            "the server normalizes them)."
+            "the server normalizes them). This still applies when the user has ALREADY "
+            "been through extract_reference_* and you're iterating on the prompt."
         ),
         meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
     )
@@ -1671,37 +2191,24 @@ def _build_mcp() -> FastMCP:
             ),
         )
         async def compose_thumbnail_prompt_tool(
-            title: Annotated[str, Field(description="What the thumbnail is about — usually the user's video title.")],
+            title: Annotated[str, Field(description="What the thumbnail is about - usually the user's video title.")],
             reference_url: Annotated[str, Field(description="The reference thumbnail URL the user picked. YouTube URLs / IDs / image URLs all accepted.")],
-            reference_title: Annotated[str | None, Field(description="The ORIGINAL video title that the reference thumbnail was made for. PASS THIS whenever you have it (it comes back as `title` on each outlier from find_outlier_references). Without it, the mapping is forced to photocopy visuals; with it, Gemini can reason about WHY the reference's design choices fit ITS title before adapting that logic to the user's NEW title.")] = None,
+            reference_title: Annotated[str | None, Field(description="The ORIGINAL video title that the reference thumbnail was made for. Pass when known so the mapper can reason about WHY the reference design choices fit ITS title before adapting that logic to the user new title.")] = None,
             style_preset: Annotated[str, Field(description="person_focal | faceless | none. Default person_focal.")] = "person_focal",
-            custom_instructions: Annotated[str | None, Field(description="Optional free-text directives from the user that get appended to the compose prompt with highest salience (they override the default rules where they conflict). Use for sticky design preferences like 'always 3 people not 1', 'dark moody palette regardless of reference', 'include the word EXPOSED in the corner'. Driven by the widget's Custom Instructions textarea.")] = None,
+            custom_instructions: Annotated[str | None, Field(description="Optional free-text directives that get appended with highest salience.")] = None,
         ) -> str:
-            """Single-call reasoned compose:
-              1. One multimodal Gemini call sees the reference image + its
-                 original title + the user's new title.
-              2. Gemini internally walks a comprehensive visual checklist
-                 (meta, composition, objects, palette, lighting, text OCR,
-                 semantic relationships, visual devices) as chain-of-thought.
-              3. Reasons about WHY each element fits the reference title.
-              4. Maps that design logic onto the user's new title.
-              5. Outputs one polished natural-language image-gen prompt.
+            """Background-submit compose. Returns {state: pending, task_id}
+            immediately and runs the vision+synth chain on an asyncio task.
+            The widget polls check_compose_status(task_id) until the entry
+            flips to success/fail. Decouples wall-clock latency from
+            claude.ai's hard 60s per-request timeout."""
+            import json, uuid as _uuid
+            import time as _time
 
-            Earlier two-call version (separate vision-to-JSON + mapping)
-            blew claude.ai's ~60s MCP timeout. Single-call keeps the same
-            reasoning rigor (the checklist is embedded in the prompt) at
-            roughly half the latency.
-            """
-            import json
             resolved = _resolve_reference_url(reference_url)
             if not resolved:
-                return json.dumps({"success": False, "error": "Invalid reference URL."})
+                return json.dumps({"success": False, "state": "fail", "error": "Invalid reference URL."})
 
-            # If the caller didn't pass the reference's original title but
-            # the URL is a YouTube video, fetch the title via youtubei.js
-            # so the reasoned mapping has the semantic anchor it needs.
-            # Falls back silently if extraction fails (mapping still works
-            # from image alone, just less effectively).
             if not reference_title:
                 vid = extract_video_id(reference_url) or extract_video_id(resolved)
                 if vid:
@@ -1710,29 +2217,65 @@ def _build_mcp() -> FastMCP:
                         reference_title = info["title"]
                         logger.info(f"auto-fetched reference title via youtubei.js: {reference_title!r}")
 
-            mapped, map_err = _map_reference_to_title_via_gemini(
-                title=title,
-                reference_url=resolved,
-                reference_title=reference_title,
-                style_preset=style_preset,
-                custom_instructions=custom_instructions,
-            )
-            if not mapped:
-                return json.dumps({
-                    "success": False,
-                    "error": f"Reasoned mapping failed: {map_err or 'unknown'}",
-                })
-
-            payload = {
-                "success": True,
+            task_id = f"{_COMPOSE_PREFIX}{_uuid.uuid4().hex}"
+            _COMPOSE_PENDING[task_id] = {
+                "state": "pending",
+                "started_at": _time.time(),
                 "title": title,
-                "reference_url": resolved,
-                "reference_title": reference_title,
-                "style_preset": style_preset,
-                "prompt": mapped,
-                "mode": "reasoned",
             }
-            return json.dumps(payload, default=str)
+            if len(_COMPOSE_PENDING) > _COMPOSE_PENDING_MAX:
+                oldest = sorted(_COMPOSE_PENDING.items(), key=lambda kv: kv[1].get("started_at", 0))
+                for k, _v in oldest[: len(_COMPOSE_PENDING) - _COMPOSE_PENDING_MAX]:
+                    _COMPOSE_PENDING.pop(k, None)
+
+            async def _run_compose():
+                t0 = _time.monotonic()
+                logger.info(f"compose bg-start task_id={task_id[-12:]} title={title!r}")
+                try:
+                    mapped, map_err = await asyncio.to_thread(
+                        _map_reference_to_title_via_gemini,
+                        title=title,
+                        reference_url=resolved,
+                        reference_title=reference_title,
+                        style_preset=style_preset,
+                        custom_instructions=custom_instructions,
+                    )
+                except Exception as e:
+                    logger.error(f"compose bg-crashed task_id={task_id[-12:]}: {e!r}")
+                    _COMPOSE_PENDING[task_id] = {
+                        "state": "fail",
+                        "error": f"Compose crashed: {type(e).__name__}: {e}"[:300],
+                        "title": title,
+                    }
+                    return
+                dt = _time.monotonic() - t0
+                if not mapped:
+                    logger.warning(f"compose bg-fail task_id={task_id[-12:]} dt={dt:.1f}s err={map_err!r}")
+                    _COMPOSE_PENDING[task_id] = {
+                        "state": "fail",
+                        "error": f"Reasoned mapping failed: {map_err or 'unknown'}",
+                        "title": title,
+                    }
+                else:
+                    logger.info(f"compose bg-done task_id={task_id[-12:]} dt={dt:.1f}s chars={len(mapped)}")
+                    _COMPOSE_PENDING[task_id] = {
+                        "state": "success",
+                        "success": True,
+                        "title": title,
+                        "reference_url": resolved,
+                        "reference_title": reference_title,
+                        "style_preset": style_preset,
+                        "prompt": mapped,
+                        "mode": "reasoned",
+                        "completed_at": _time.time(),
+                    }
+
+            asyncio.create_task(_run_compose())
+            return json.dumps({
+                "state": "pending",
+                "task_id": task_id,
+                "title": title,
+            })
 
     # ----- Algrow-powered outlier picker -----------------------------------
     # Always registered — authenticates per-request via the user's algora
@@ -1740,6 +2283,26 @@ def _build_mcp() -> FastMCP:
     # (and Claude, when called from chat) pull high-outlier-score thumbnails
     # for a topic and offer them as references.
     if True:
+
+        @mcp.tool(
+            name="check_compose_status",
+            description=(
+                "Poll a background compose job by task_id (returned from "
+                "compose_thumbnail_prompt with state=pending). Returns the "
+                "same payload shape compose used to return synchronously "
+                "once complete: {success: true, prompt, ...}. While running, "
+                "returns {state: pending}. Widget should poll every 2s."
+            ),
+        )
+        async def check_compose_status_tool(
+            task_id: Annotated[str, Field(description="task_id returned from compose_thumbnail_prompt")],
+        ) -> str:
+            import json
+            info = _COMPOSE_PENDING.get(task_id)
+            if not info:
+                return json.dumps({"state": "fail", "success": False, "error": "Unknown task_id (expired or invalid)"})
+            return json.dumps(info, default=str)
+
         @mcp.tool(
             name="find_outlier_references",
             title="Find Outlier Thumbnails on a Topic",
@@ -1823,13 +2386,10 @@ def _build_mcp() -> FastMCP:
             # finds") which over-generalizes the semantic search and
             # surfaces off-topic outliers. Force the verbatim title here.
             search_query = (title or topic or "").strip()
-            # Fresh task invocation — clear any saved WIP for this title so
-            # the widget starts clean instead of restoring stale state from
-            # a prior chat session under the same title.
-            if title:
-                bucket = _load_state_bucket()
-                if bucket.pop(_state_key(title), None) is not None:
-                    _save_state_bucket(bucket)
+            # Fresh task invocation. With per-instance state rows (keyed by
+            # the widget mount's toolInfo.id) each new mount already gets a
+            # fresh row, so we no longer need to clear bucket entries to
+            # avoid stale-state restore.
             outliers, error, effective_topic, has_more = _fetch_outliers_from_algrow(
                 topic=search_query,
                 content_type=content_type,
@@ -1924,10 +2484,8 @@ def _build_mcp() -> FastMCP:
         # widget starts clean. Cross-device sync within one conversation
         # still works because chat reopens replay cached tool results
         # rather than re-firing this tool.
-        if user_title:
-            bucket = _load_state_bucket()
-            if bucket.pop(_state_key(user_title), None) is not None:
-                _save_state_bucket(bucket)
+        # Fresh task invocation. Same rationale as in find_outlier_references:
+        # per-instance state rows make clearing-by-title obsolete.
         info = extract_video_info(url_or_id)
         if not info.get("success"):
             return json.dumps({
@@ -1967,6 +2525,427 @@ def _build_mcp() -> FastMCP:
             payload["auto_pipeline"] = True
         return json.dumps(payload, default=str)
 
+    # ----- Reference by direct image URL ---------------------------------
+    # Same shape as extract_reference_from_video but for non-YouTube images:
+    # R2 mirrors (audio.algrow.online/thumbnails/...), raw .jpg/.png URLs the
+    # user uploaded or pasted, anything that's already a visual reference and
+    # doesn't need video-info lookup. Returns the same auto_pipeline payload
+    # so the widget runs the identical compose-then-generate chain.
+    @mcp.tool(
+        name="extract_reference_from_image",
+        title="Use a Direct Image URL as the Reference",
+        description=(
+            "Use this when the user wants to base a thumbnail on a SPECIFIC "
+            "image they've linked that ISN'T a YouTube video — e.g. "
+            "audio.algrow.online R2 mirror URLs, raw .jpg/.png/.webp URLs, "
+            "screenshots they uploaded, or any direct image reference. "
+            "Mounts the widget with the reference preselected and — if "
+            "you pass `user_title` — auto-runs the full compose + "
+            "generate pipeline (~45-65s with stage-by-stage progress).\n\n"
+            "BEHAVIOR DEPENDS ON `user_title`:\n"
+            "  • With `user_title`: widget chains compose → generate "
+            "automatically.\n"
+            "  • Without `user_title`: widget mounts with the reference "
+            "preselected; user clicks Create Prompt → Generate.\n\n"
+            "ALWAYS pass `user_title` when you have it. After calling, STOP.\n\n"
+            "If the reference is a YouTube link, use extract_reference_from_video "
+            "instead so the server can also fetch the original video's title "
+            "(which makes the compose step\'s reasoning measurably better)."
+        ),
+        meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
+    )
+    async def extract_reference_from_image_tool(
+        image_url: Annotated[str, Field(description="Direct image URL. Must be http(s). R2 mirrors / raw .jpg / .png / .webp / .gif are all fine; the server passes the URL through unchanged.")],
+        user_title: Annotated[str | None, Field(description="The user\'s NEW video title — what THEIR thumbnail is for. Widget pre-fills its title field with this and triggers the auto-pipeline. Always pass when you have it.")] = None,
+        reference_title: Annotated[str | None, Field(description="Optional. If the user mentioned what the reference image is OF / what it was made for, pass that here so the compose step can reason about WHY the reference\'s design works before adapting it. Skip if unknown.")] = None,
+        model: Annotated[str, Field(description="Image-gen backend the widget preselects. Same options as extract_reference_from_video: 'nano-banana-pro' (default, 3 cr), 'gpt-image-2' (1 cr), 'seedream-5.0-lite' (2 cr, more permissive safety), 'seedream-4.5-edit' (2 cr, image-to-image edit). Default 'nano-banana-pro'.")] = "nano-banana-pro",
+    ) -> str:
+        import json
+        resolved = _resolve_reference_url(image_url)
+        if not resolved:
+            return json.dumps({
+                "view": "outlier_picker",
+                "topic": user_title or "",
+                "outliers": [],
+                "count": 0,
+                "error": "Invalid image URL — must be http(s) and resolvable.",
+                **({"title": user_title} if user_title else {}),
+            })
+
+        # Fresh task invocation — clear any saved WIP for this title so the
+        # widget starts clean. (Per-instance state still works because each
+        # widget mount has its own toolInfo.id row.)
+        if user_title:
+            try:
+                _state_save(f"legacy:{_state_key(user_title)}", _state_key(user_title), {})
+            except Exception:
+                pass  # DB blip — widget will just overwrite on first save
+
+        outlier = {
+            "video_id": None,
+            "title": reference_title or "",
+            "thumbnail_url": resolved,
+            "channel_name": "",
+            "channel_thumbnail": None,
+            "view_count": None,
+            "outlier_score": None,
+            "url": resolved,
+        }
+        payload = {
+            "view": "outlier_picker",
+            "topic": user_title or reference_title or "",
+            "outliers": [outlier],
+            "count": 1,
+            "content_type": "longform",
+            "single_reference": True,
+            "model": model,
+        }
+        if user_title:
+            payload["title"] = user_title
+            payload["auto_pipeline"] = True
+        return json.dumps(payload, default=str)
+
+
+    # ----- Channel-style DNA: chat entrypoint ----------------------------
+    # When the user wants "a thumbnail in @creator's style" we don't pick a
+    # single reference — we fingerprint the channel's recurring visual grammar
+    # across the top-10 by-views thumbnails and apply that grammar to the
+    # user's new title. Heavy lifting is in compose_channel_style_prompt
+    # below; this tool just resolves the channel and mounts the widget with
+    # a payload that flips the auto-pipeline into channel-style mode.
+    @mcp.tool(
+        name="extract_reference_from_channel",
+        title="Use a Whole Channel's Style as the Reference",
+        description=(
+            "Use this when the user wants a thumbnail in the STYLE of a "
+            "whole creator/channel — NOT a single reference video. "
+            "Examples: 'make a thumbnail in MrBeast's style', "
+            "'thumbnail like @fern-tv would make', 'use the Veritasium "
+            "design system'. \n\n"
+            "WHAT IT DOES (server-side, ~90-120s first time, ~5s on cache hit):\n"
+            "  1. Resolves the @handle / UC id via Algrow.\n"
+            "  2. Fetches the channel's TOP 10 BY VIEW COUNT thumbnails.\n"
+            "  3. Vision-analyzes all 10 in parallel.\n"
+            "  4. Synthesizes a channel DNA (palette, typography, "
+            "composition, lighting, effects) + an exhaustive text prompt "
+            "applying that DNA to the user's title. Cached 30 days.\n"
+            "  5. Generates the thumbnail WITHOUT any reference image — "
+            "the prompt carries the entire style.\n\n"
+            "ALWAYS pass `user_title` when you have it (the new video the "
+            "user is making a thumbnail for). After calling, STOP — the "
+            "widget runs the rest."
+        ),
+        meta={"ui": {"resourceUri": widgets.THUMBNAIL_STUDIO_URI}},
+    )
+    async def extract_reference_from_channel_tool(
+        channel: Annotated[str, Field(description="YouTube @handle (e.g. @fern-tv) OR channel ID (UCxxxxxxxxxxxxxxxxxxxxxx, 24 chars). The leading @ is optional for handles.")],
+        user_title: Annotated[str | None, Field(description="The user's NEW video title. Channel DNA gets applied to this title to produce the final thumbnail. Always pass when you have it.")] = None,
+        model: Annotated[str, Field(description="Image-gen backend the widget preselects. Same options as extract_reference_from_video. Default 'nano-banana-pro'. Note: channel-style mode generates WITHOUT a reference image, so models that rely on img2img (seedream-4.5-edit) are a poor fit here — pick a regenerative model.")] = "nano-banana-pro",
+    ) -> str:
+        import json
+        info, err = _resolve_channel_via_algrow(channel)
+        if err or not info:
+            return json.dumps({
+                "view": "outlier_picker",
+                "topic": user_title or channel,
+                "outliers": [],
+                "count": 0,
+                "error": err or "Could not resolve channel.",
+                **({"title": user_title} if user_title else {}),
+            })
+
+        # Fetch the channel's actual top-by-views thumbnails synchronously
+        # so the widget mounts with 10 real cards instead of a single
+        # placeholder. Adds ~4-6s to the chat-side tool latency but kills
+        # the "ghost placeholder while it analyzes" UX gap.
+        channel_id = info["channel_id"]
+        top_videos, top_err = _fetch_channel_top_videos(channel_id)
+        # Innertube meta (display name + avatar) — call the bridge again
+        # cheaply if the first fetch went through Algrow (which doesn't
+        # return meta). Skip if top_videos already came from Innertube; in
+        # that case we already paid the cost.
+        avatar_url = info.get("channel_thumbnail")
+        display_name = info["channel_name"]
+        try:
+            _v, meta, _e = _fetch_channel_videos_via_innertube(channel_id, 1)
+            if meta:
+                avatar_url = meta.get("avatar_url") or avatar_url
+                display_name = meta.get("name") or display_name
+        except Exception:
+            pass  # avatar/name enrichment is best-effort
+
+        if top_err or not top_videos:
+            # Resolution worked but we couldn't pull videos. Fall back to
+            # the single-placeholder card so the user still sees the
+            # channel mounted (and can retry).
+            top_videos = []
+
+        outliers = []
+        if top_videos:
+            for v in top_videos:
+                outliers.append({
+                    "video_id": v["video_id"],
+                    "title": v.get("title") or "",
+                    "thumbnail_url": v["thumbnail_url"],
+                    "channel_name": display_name,
+                    "channel_thumbnail": avatar_url,
+                    "view_count": v.get("view_count"),
+                    "outlier_score": None,
+                    "url": f"https://www.youtube.com/watch?v={v['video_id']}",
+                })
+        else:
+            outliers.append({
+                "video_id": None,
+                "title": f"{display_name} channel style",
+                "thumbnail_url": avatar_url or "https://www.youtube.com/img/desktop/yt_1200.png",
+                "channel_name": display_name,
+                "channel_thumbnail": avatar_url,
+                "view_count": None,
+                "outlier_score": None,
+                "url": f"https://www.youtube.com/channel/{channel_id}",
+            })
+
+        payload = {
+            "view": "outlier_picker",
+            "topic": user_title or display_name,
+            "outliers": outliers,
+            "count": len(outliers),
+            "content_type": "longform",
+            "single_reference": True,
+            "model": model,
+            "channel_style_mode": True,
+            "channel_id": channel_id,
+            "channel_handle": info.get("handle"),
+            "channel_name": display_name,
+            "channel_avatar": avatar_url,
+        }
+        if user_title:
+            payload["title"] = user_title
+            payload["auto_pipeline"] = True
+        return json.dumps(payload, default=str)
+
+
+    # ----- Channel-style DNA: widget poll-driven compose -----------------
+    # Background-submit, same shape as compose_thumbnail_prompt. Returns
+    # {state: pending, task_id} immediately; widget polls check_compose_status
+    # until success/fail. Reuses _COMPOSE_PENDING so the existing poll loop
+    # in the widget needs zero changes — the helper that reads task_id
+    # doesn't care which compose tool wrote into the dict.
+    @mcp.tool(
+        name="compose_channel_style_prompt",
+        title="Compose Thumbnail Prompt from Channel DNA",
+        description=(
+            "INTERNAL widget helper. The thumbnail-studio widget calls this "
+            "when channel_style_mode is true. Builds (or reads from 30-day "
+            "cache) the channel's design DNA across its top-10 by-views "
+            "thumbnails, then emits an exhaustive text prompt that applies "
+            "that DNA to the user's title. Returns {state: pending, task_id} "
+            "immediately; poll check_compose_status. Do NOT call from chat."
+        ),
+    )
+    async def compose_channel_style_prompt_tool(
+        channel_id: Annotated[str, Field(description="YouTube channel ID (UCxxxxxxxxxxxxxxxxxxxxxx) — already resolved by extract_reference_from_channel.")],
+        title: Annotated[str, Field(description="The user's new video title to apply the channel DNA to.")],
+        channel_name: Annotated[str, Field(description="Channel name for display + synthesis prompt context.")] = "",
+        channel_handle: Annotated[str | None, Field(description="@handle if known. Optional, used for synthesis prompt context.")] = None,
+    ) -> str:
+        import json, uuid as _uuid
+        import time as _time
+
+        task_id = f"{_CHANNEL_COMPOSE_PREFIX}{_uuid.uuid4().hex}"
+        _COMPOSE_PENDING[task_id] = {
+            "state": "pending",
+            "started_at": _time.time(),
+            "title": title,
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+        }
+        if len(_COMPOSE_PENDING) > _COMPOSE_PENDING_MAX:
+            oldest = sorted(_COMPOSE_PENDING.items(), key=lambda kv: kv[1].get("started_at", 0))
+            for k, _v in oldest[: len(_COMPOSE_PENDING) - _COMPOSE_PENDING_MAX]:
+                _COMPOSE_PENDING.pop(k, None)
+
+        # Snapshot the request-bound keys NOW — these ContextVars don't
+        # propagate to worker threads (asyncio.to_thread), so we must capture
+        # them while still inside the request handler.
+        from auth_ctx import get_current_api_key as _get_algora_key
+        _request_algora_key = (_get_algora_key() or "").strip() or None
+        try:
+            from algrow_byok import get_key as _byok_get
+            _request_gemini_key = _byok_get("gemini") or _GEMINI_API_KEY
+        except Exception:
+            _request_gemini_key = _GEMINI_API_KEY
+
+        async def _run_channel_compose():
+            t0 = _time.monotonic()
+            logger.info(f"channel-style bg-start task={task_id[-12:]} channel={channel_id} title={title!r}")
+            try:
+                cached = await asyncio.to_thread(_channel_dna_load, channel_id)
+                if cached:
+                    logger.info(f"channel-style cache HIT channel={channel_id}; matching new title")
+                    cached_analyses = cached.get("source_analyses") or []
+                    if isinstance(cached_analyses, str):
+                        try:
+                            cached_analyses = _json_top.loads(cached_analyses)
+                        except Exception:
+                            cached_analyses = []
+                    cached_titles = cached.get("source_titles") or []
+                    if isinstance(cached_titles, str):
+                        try:
+                            cached_titles = _json_top.loads(cached_titles)
+                        except Exception:
+                            cached_titles = []
+                    cached_thumbs = cached.get("source_thumb_urls") or []
+                    if isinstance(cached_thumbs, str):
+                        try:
+                            cached_thumbs = _json_top.loads(cached_thumbs)
+                        except Exception:
+                            cached_thumbs = []
+
+                    match, match_err = await asyncio.to_thread(
+                        _build_matched_prompt,
+                        cached_analyses, cached_titles, cached_thumbs, title,
+                        cached.get("channel_name") or channel_name,
+                        cached.get("handle") or channel_handle,
+                        gemini_key=_request_gemini_key,
+                    )
+                    if match_err or not match:
+                        _COMPOSE_PENDING[task_id] = {
+                            "state": "fail",
+                            "error": f"Channel-style match (cached) failed: {match_err or 'no output'}",
+                            "title": title,
+                        }
+                        return
+
+                    _COMPOSE_PENDING[task_id] = {
+                        "state": "success",
+                        "success": True,
+                        "title": title,
+                        "channel_id": channel_id,
+                        "channel_name": cached.get("channel_name") or channel_name,
+                        "prompt": match["final_prompt"],
+                        "matched_index": match["matched_index"],
+                        "matched_title": match["matched_title"],
+                        "matched_thumb_url": match["matched_thumb_url"],
+                        "match_reason": match["match_reason"],
+                        "channel_constants_lift": match["channel_constants_lift"],
+                        "source_thumb_urls": cached_thumbs,
+                        "source_titles": cached_titles,
+                        "mode": "channel_style_cached",
+                        "completed_at": _time.time(),
+                    }
+                    logger.info(
+                        f"channel-style bg-done CACHED task={task_id[-12:]} "
+                        f"dt={_time.monotonic()-t0:.1f}s matched_idx={match['matched_index']} "
+                        f"chars={len(match['final_prompt'])}"
+                    )
+                    return
+
+                # ---- cache miss: full pipeline ----
+                videos, fetch_err = await asyncio.to_thread(
+                    _fetch_channel_top_videos, channel_id,
+                    api_key=_request_algora_key,
+                )
+                if not videos:
+                    _COMPOSE_PENDING[task_id] = {
+                        "state": "fail",
+                        "error": fetch_err or "Channel has no analyzable videos.",
+                        "title": title,
+                    }
+                    return
+
+                thumb_urls = [v["thumbnail_url"] for v in videos]
+                titles = [v["title"] for v in videos]
+                logger.info(f"channel-style fetched {len(thumb_urls)} thumbs; firing parallel vision passes")
+
+                # Parallel vision pass — _analyze_image_via_gemini is sync,
+                # use to_thread per call inside gather.
+                async def _one(u):
+                    return await asyncio.to_thread(_analyze_image_via_gemini, u)
+                results = await asyncio.gather(*[_one(u) for u in thumb_urls], return_exceptions=True)
+                analyses: list[dict] = []
+                vision_errors: list[str] = []
+                for i, r in enumerate(results):
+                    if isinstance(r, Exception):
+                        vision_errors.append(f"thumb {i}: {r!r}")
+                        continue
+                    analysis, err = r
+                    if analysis:
+                        analyses.append(analysis)
+                    else:
+                        vision_errors.append(f"thumb {i}: {err}")
+
+                logger.info(f"channel-style vision: {len(analyses)} succeeded, {len(vision_errors)} failed")
+                if len(analyses) < 3:
+                    _COMPOSE_PENDING[task_id] = {
+                        "state": "fail",
+                        "error": f"Too few thumbnails analyzed successfully ({len(analyses)}/{len(thumb_urls)}). Errors: " + " | ".join(vision_errors[:3]),
+                        "title": title,
+                    }
+                    return
+
+                # Fresh build: cache the analyses FIRST so a crash during
+                # the match step doesn't waste the ~$0.30 vision spend.
+                try:
+                    await asyncio.to_thread(
+                        _channel_dna_save, channel_id, channel_handle, channel_name,
+                        None, None, thumb_urls, titles, analyses,
+                    )
+                except Exception as e:
+                    logger.warning(f"channel-style cache save (analyses-only) failed: {e}")
+
+                match, match_err = await asyncio.to_thread(
+                    _build_matched_prompt,
+                    analyses, titles, thumb_urls, title,
+                    channel_name, channel_handle,
+                    gemini_key=_request_gemini_key,
+                )
+                if match_err or not match:
+                    _COMPOSE_PENDING[task_id] = {
+                        "state": "fail",
+                        "error": f"Channel-style match (fresh) failed: {match_err or 'no output'}",
+                        "title": title,
+                    }
+                    return
+
+                _COMPOSE_PENDING[task_id] = {
+                    "state": "success",
+                    "success": True,
+                    "title": title,
+                    "channel_id": channel_id,
+                    "channel_name": channel_name,
+                    "prompt": match["final_prompt"],
+                    "matched_index": match["matched_index"],
+                    "matched_title": match["matched_title"],
+                    "matched_thumb_url": match["matched_thumb_url"],
+                    "match_reason": match["match_reason"],
+                    "channel_constants_lift": match["channel_constants_lift"],
+                    "source_thumb_urls": thumb_urls,
+                    "source_titles": titles,
+                    "mode": "channel_style",
+                    "completed_at": _time.time(),
+                }
+                logger.info(
+                    f"channel-style bg-done FRESH task={task_id[-12:]} "
+                    f"dt={_time.monotonic()-t0:.1f}s matched_idx={match['matched_index']} "
+                    f"chars={len(match['final_prompt'])}"
+                )
+            except Exception as e:
+                logger.error(f"channel-style crashed task={task_id[-12:]}: {e!r}")
+                _COMPOSE_PENDING[task_id] = {
+                    "state": "fail",
+                    "error": f"Channel DNA pipeline crashed: {type(e).__name__}: {e}"[:300],
+                    "title": title,
+                }
+
+        asyncio.create_task(_run_channel_compose())
+        return json.dumps({
+            "state": "pending",
+            "task_id": task_id,
+            "title": title,
+        })
+
+
     # ----- Claude-as-editor: refine the existing engineered prompt --------
     # The original compose path (find_outlier_references / extract_reference_
     # from_video → user picks → Create Prompt → Generate) stays untouched.
@@ -2002,8 +2981,14 @@ def _build_mcp() -> FastMCP:
         user_title: Annotated[str, Field(description="The user's video title — same value used when the original compose ran. State is keyed by this.")],
     ) -> str:
         import json
-        bucket = _load_state_bucket()
-        state = bucket.get(_state_key(user_title))
+        # Lookup by title returns the most recently updated widget mount for
+        # that title — which is what the user means by "the prompt for this
+        # title" when iterating in chat.
+        try:
+            state = _state_load_latest_by_title(_state_key(user_title))
+        except Exception as e:
+            logger.error(f"get_widget_prompt DB error: {e}")
+            state = None
         if not state or not state.get("prompt"):
             return json.dumps({
                 "success": False,
@@ -2041,8 +3026,12 @@ def _build_mcp() -> FastMCP:
         new_prompt: Annotated[str, Field(description="The edited engineered prompt to save. Goes verbatim into the widget's prompt textarea and is sent verbatim to the image-gen model when the user clicks Generate. Preserve every unchanged detail from the original prompt — refinements should be surgical, not wholesale rewrites.")],
     ) -> str:
         import json
-        bucket = _load_state_bucket()
-        state = bucket.get(_state_key(user_title)) or {"title": user_title}
+        title_key = _state_key(user_title)
+        try:
+            state = _state_load_latest_by_title(title_key) or {"title": user_title}
+        except Exception as e:
+            logger.error(f"set_widget_prompt DB load error: {e}")
+            state = {"title": user_title}
         state["prompt"] = new_prompt
         state["promptIsComposed"] = True
         # Multi-turn editing: BEFORE clearing the cached generation result,
@@ -2064,8 +3053,14 @@ def _build_mcp() -> FastMCP:
         # the stale image into the preview pane on the next mount.
         state["lastResultPayload"] = None
         state["ts"] = int(time.time() * 1000)
-        bucket[_state_key(user_title)] = state
-        _save_state_bucket(bucket)
+        # Write under a stable legacy id so any fresh widget mount (which
+        # gets a brand-new toolInfo.id) falls back to this row via the
+        # most-recent-by-title lookup in load_widget_state.
+        try:
+            _state_save(f"legacy:{title_key}", title_key, state)
+        except Exception as e:
+            logger.error(f"set_widget_prompt DB save error: {e}")
+            return json.dumps({"success": False, "error": f"Could not save prompt: {e}"})
 
         sel = state.get("selectedOutlier")
         payload = {
@@ -2095,21 +3090,25 @@ def _build_mcp() -> FastMCP:
         ),
     )
     async def save_widget_state_tool(
-        key: Annotated[str, Field(description="Lowercased, trimmed video title used as the bucket key.")],
+        key: Annotated[str, Field(description="Lowercased, trimmed video title used as the bucket key (title_key).")],
         state: Annotated[dict, Field(description="Opaque state blob the widget wants to persist. Stored as-is.")],
+        instance_id: Annotated[str | None, Field(description="Per-widget-mount identifier (hostContext.toolInfo.id). When provided, each widget mount keeps its own row instead of overwriting prior mounts for the same title. The widget always passes this; chat-side callers may omit it (legacy path falls back to a synthetic id derived from the title).")] = None,
     ) -> str:
         import json
         k = _state_key(key)
         if not k:
             return json.dumps({"success": False, "error": "Empty key."})
-        bucket = _load_state_bucket()
-        bucket[k] = {**(state or {}), "ts": int(time.time() * 1000)}
-        # Cap to N most-recent entries so the JSON file stays bounded.
-        if len(bucket) > _MAX_STATE_ENTRIES:
-            kept = sorted(bucket.items(), key=lambda x: x[1].get("ts", 0), reverse=True)[:_MAX_STATE_ENTRIES]
-            bucket = dict(kept)
-        _save_state_bucket(bucket)
-        return json.dumps({"success": True})
+        # If the caller didn't pass an instance_id, derive a per-title synthetic
+        # one so chat-originated saves still land in the table (preserving the
+        # "use my prior reference for this title" flow). Each per-title chat
+        # save overwrites the same synthetic row, matching old JSON behaviour.
+        iid = (instance_id or "").strip() or f"legacy:{k}"
+        try:
+            _state_save(iid[:128], k, {**(state or {}), "ts": int(time.time() * 1000)})
+            return json.dumps({"success": True})
+        except Exception as e:
+            logger.error(f"save_widget_state DB error: {e}")
+            return json.dumps({"success": False, "error": f"DB write failed: {e}"})
 
     @mcp.tool(
         name="load_widget_state",
@@ -2138,14 +3137,36 @@ def _build_mcp() -> FastMCP:
         ),
     )
     async def load_widget_state_tool(
-        key: Annotated[str, Field(description="Lowercased, trimmed video title used as the bucket key.")],
+        key: Annotated[str, Field(description="Lowercased, trimmed video title used as the bucket key (title_key).")],
+        instance_id: Annotated[str | None, Field(description="Optional per-mount identifier. When provided, returns ONLY that widget mount's state. When omitted, returns the most recently updated state for the title (the legacy chat-side behaviour).")] = None,
     ) -> str:
         import json
         k = _state_key(key)
         if not k:
             return json.dumps({"success": True, "state": None})
-        bucket = _load_state_bucket()
-        return json.dumps({"success": True, "state": bucket.get(k)})
+        try:
+            if instance_id and instance_id.strip():
+                # Strict per-instance lookup. NO fallback to title-keyed row
+                # here — letting that fallback fire on a fresh widget mount
+                # was bleeding prior failed runs into brand-new chats that
+                # happened to use the same title. If this instance has no
+                # row, the widget gets null and starts clean.
+                st = _state_load_by_instance(instance_id.strip()[:128])
+            else:
+                # Chat-side path (LLM tool call with no instance_id) — the
+                # "use my prior reference for this title" flow still wants
+                # the most-recent-by-title row, that's its whole purpose.
+                st = _state_load_latest_by_title(k)
+            return json.dumps({"success": True, "state": st})
+        except Exception as e:
+            logger.error(f"load_widget_state DB error: {e}")
+            # Last-ditch: fall back to the legacy file so a transient DB
+            # outage doesn't blank everyone's widgets.
+            try:
+                bucket = _load_state_bucket()
+                return json.dumps({"success": True, "state": bucket.get(k), "fallback": "file"})
+            except Exception:
+                return json.dumps({"success": True, "state": None, "error": str(e)})
 
     @mcp.tool(
         name="upload_reference_image",
