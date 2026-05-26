@@ -119,6 +119,11 @@ _COMPOSE_PREFIX = "compose_pending:"
 _COMPOSE_PENDING: dict[str, dict] = {}
 _COMPOSE_PENDING_MAX = 200
 
+# Track task_ids already recorded to history so repeated status polls don't
+# create duplicate studio_generations rows. Bounded same as _GEMINI_TASKS.
+_HISTORY_RECORDED: set[str] = set()
+_HISTORY_RECORDED_MAX = 400
+
 # =============================================================================
 # Channel-style DNA pipeline
 # =============================================================================
@@ -625,6 +630,47 @@ logger = logging.getLogger("thumbnails-mcp")
 # The previous shared-token model (THUMBNAILS_MCP_TOKEN) is gone — this
 # server is now exclusively for algora subscribers, no self-host mode.
 _ALGROW_API_BASE = (os.environ.get("ALGROW_API_BASE_URL") or "https://api.algrow.online").rstrip("/")
+
+
+def _record_generation_to_history(
+    api_key: str,
+    task_id: str,
+    prompt: str,
+    model: str,
+    aspect_ratio: str,
+    image_urls: list[str],
+    reference_image_used: bool = False,
+) -> None:
+    """POST the completed generation to algora's /api/record-thumbnail so it
+    shows up in the user's /studio image history. Fire-and-forget; any error
+    is logged but never propagated — caller must not block on this."""
+    global _HISTORY_RECORDED
+    if task_id in _HISTORY_RECORDED:
+        return
+    _HISTORY_RECORDED.add(task_id)
+    if len(_HISTORY_RECORDED) > _HISTORY_RECORDED_MAX:
+        # Trim by discarding the first half when over cap.
+        items = list(_HISTORY_RECORDED)
+        _HISTORY_RECORDED = set(items[len(items) // 2:])
+    try:
+        import requests as _req
+        _req.post(
+            f"{_ALGROW_API_BASE}/api/record-thumbnail",
+            json={
+                "prompt": prompt,
+                "model": model,
+                "aspect_ratio": aspect_ratio,
+                "image_urls": image_urls,
+                "task_id": task_id,
+                "reference_image_used": reference_image_used,
+                "api_provider": "thumbnail_mcp",
+            },
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+    except Exception as _e:
+        logger.warning(f"record-thumbnail history call failed for task {task_id}: {_e}")
+
 
 # Optional Gemini vision — when set, references get auto-analyzed into a
 # structured JSON breakdown (composition, palette, lighting, text style,
@@ -1986,6 +2032,8 @@ def _build_mcp() -> FastMCP:
         model: Annotated[str, Field(description="Echoed back so the model dropdown stays in sync across polls.")] = "nano-banana-pro",
     ) -> str:
         import json
+        from auth_ctx import get_current_api_key as _get_key
+        _api_key_for_status = _get_key()
 
         payload = {
             "prompt": prompt,
@@ -1998,6 +2046,15 @@ def _build_mcp() -> FastMCP:
             "outlier_topic": outlier_topic,
             "model": model,
         }
+
+        def _fire_history(imgs: list[str]) -> None:
+            """Record this completion to algora studio history (non-blocking)."""
+            if _api_key_for_status:
+                asyncio.create_task(asyncio.to_thread(
+                    _record_generation_to_history,
+                    _api_key_for_status, task_id, prompt, model, aspect_ratio, imgs,
+                    bool(reference_urls),
+                ))
 
         # Algrow tasks have a prefixed task_id; everything else is Kie.
         # Gemini-direct background tasks live in an in-process dict.
@@ -2015,12 +2072,14 @@ def _build_mcp() -> FastMCP:
                 return json.dumps(payload, default=str)
             state = entry.get("state")
             if state == "success":
+                imgs = [entry["image_url"]] if entry.get("image_url") else []
                 payload.update({
                     "state": "success",
-                    "images": [entry["image_url"]] if entry.get("image_url") else [],
+                    "images": imgs,
                     "backend": "gemini-3-pro-image-preview",
                     "cost_time_s": entry.get("cost_time_s"),
                 })
+                _fire_history(imgs)
             elif state == "fail":
                 payload.update({
                     "state": "fail",
@@ -2033,8 +2092,7 @@ def _build_mcp() -> FastMCP:
             return json.dumps(payload, default=str)
 
         from algrow_image import is_algrow_task_id, check_image_status as _algrow_check
-        from auth_ctx import get_current_api_key as _get_key
-        _api_key_for_check = _get_key()
+        _api_key_for_check = _api_key_for_status
 
         # algrow_pending:<uuid> placeholder — set when generate_thumbnail
         # backgrounded the algrow submit. Until that submit finishes we have
@@ -2069,13 +2127,15 @@ def _build_mcp() -> FastMCP:
             ar_state = ar.get("state")
             backend_label = f"algrow:{entry.get('model') or model}"
             if ar_state == "success":
+                imgs = [ar["image_url"]] if ar.get("image_url") else []
                 payload.update({
                     "state": "success",
-                    "images": [ar["image_url"]] if ar.get("image_url") else [],
+                    "images": imgs,
                     "backend": backend_label,
                 })
                 if entry.get("credits_used") is not None:
                     payload["credits_used"] = entry["credits_used"]
+                _fire_history(imgs)
             elif ar_state == "fail":
                 payload.update({
                     "state": "fail",
@@ -2095,11 +2155,13 @@ def _build_mcp() -> FastMCP:
             ar = _algrow_check(task_id, api_key=_api_key_for_check)
             state = ar.get("state")
             if state == "success":
+                imgs = [ar["image_url"]] if ar.get("image_url") else []
                 payload.update({
                     "state": "success",
-                    "images": [ar["image_url"]] if ar.get("image_url") else [],
+                    "images": imgs,
                     "backend": f"algrow:{model}",
                 })
+                _fire_history(imgs)
             elif state == "fail":
                 payload.update({
                     "state": "fail",
@@ -2124,8 +2186,10 @@ def _build_mcp() -> FastMCP:
 
         state = status.get("state")
         if state == "success":
+            imgs = status.get("images", [])
             payload["state"] = "success"
-            payload["images"] = status.get("images", [])
+            payload["images"] = imgs
+            _fire_history(imgs)
             cost_ms = status.get("cost_time")
             if cost_ms is not None:
                 payload["cost_time_s"] = round(cost_ms / 1000, 1)
