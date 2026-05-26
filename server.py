@@ -1447,12 +1447,20 @@ def _fetch_outliers_from_algrow(topic: str, content_type: str = "longform",
         has_more = hm
         logger.info(f"algrow: page {page} returned {count} for q='{topic}'")
     else:
-        # First page — try verbatim, then shortened fallbacks.
-        candidates = [topic.strip()]
+        # First page — try shortened candidates FIRST. The full verbatim
+        # almost never has exact-word matches in algrow's ILIKE pass, and
+        # sending it forces the backend to build trigram bitmaps for every
+        # stopword ("how", "to", "in") — pushes total request to the 12s
+        # budget cap every time. Strip down to the significant keywords;
+        # the backend re-embeds whatever we send for the HNSW pass.
+        candidates: list[str] = []
         for n in (3, 2):
             short = _shorten_topic(topic, keep=n)
             if short and short.lower() not in {c.lower() for c in candidates}:
                 candidates.append(short)
+        # Fallback only when stopword-stripping yielded nothing (rare).
+        if not candidates:
+            candidates.append(topic.strip())
         for q in candidates:
             if not q:
                 continue
